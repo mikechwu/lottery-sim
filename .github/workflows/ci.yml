@@ -54,7 +54,7 @@ jobs:
         run: cargo test -p lottery-sim-core --release -- --nocapture
 
       - name: Generate golden replay
-        run: cargo run --release -p lottery-sim-core --bin gen-replay -- /tmp/golden.replay
+        run: cargo run --release -p lottery-sim-core --bin gen-replay -- /tmp/golden.replay 42 "$WASM_HASH"
 
       - name: Verify golden replay
         run: |
