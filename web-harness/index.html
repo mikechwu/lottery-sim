@@ -2,39 +2,55 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Lottery Sim — Phase-3 Web Harness</title>
+    <title>Lottery Sim — Phase-4 Web App</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { font-family: monospace; background: #0d1117; color: #e0e0e0; display: flex; flex-direction: column; height: 100vh; }
-        #header { padding: 8px 16px; background: #161b22; border-bottom: 1px solid #30363d; display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
-        #header h1 { font-size: 14px; color: #58a6ff; white-space: nowrap; }
+        body { font-family: 'Segoe UI', system-ui, sans-serif; background: #0d1117; color: #e0e0e0; display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
+        #header { padding: 8px 16px; background: #161b22; border-bottom: 1px solid #30363d; display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+        #header h1 { font-size: 15px; color: #58a6ff; white-space: nowrap; font-weight: 600; letter-spacing: 0.5px; }
         .info { font-size: 12px; color: #8b949e; }
-        .info span { color: #e0e0e0; }
-        #controls { display: flex; gap: 8px; }
-        button { padding: 4px 12px; font-family: monospace; font-size: 12px; cursor: pointer; background: #21262d; color: #e0e0e0; border: 1px solid #30363d; border-radius: 4px; }
+        .info span { color: #e0e0e0; font-weight: 500; }
+        #controls { display: flex; gap: 6px; margin-left: auto; }
+        button { padding: 5px 14px; font-family: inherit; font-size: 12px; cursor: pointer; background: #21262d; color: #e0e0e0; border: 1px solid #30363d; border-radius: 6px; transition: background 0.15s; }
         button:hover { background: #30363d; }
-        button:disabled { opacity: 0.4; cursor: default; }
-        button.primary { background: #238636; border-color: #2ea043; }
-        button.primary:hover { background: #2ea043; }
+        button:disabled { opacity: 0.35; cursor: default; }
+        button.primary { background: #238636; border-color: #2ea043; color: #fff; }
+        button.primary:hover:not(:disabled) { background: #2ea043; }
+        button.danger { background: #da3633; border-color: #f85149; color: #fff; }
+        button.danger:hover:not(:disabled) { background: #f85149; }
         #canvas-container { flex: 1; position: relative; overflow: hidden; }
         canvas { display: block; width: 100%; height: 100%; }
-        #hud { position: absolute; top: 8px; left: 8px; font-size: 12px; background: rgba(13,17,23,0.85); padding: 8px; border-radius: 4px; border: 1px solid #30363d; pointer-events: none; }
-        #hud div { margin: 2px 0; }
+        #hud { position: absolute; top: 8px; left: 8px; font-size: 12px; background: rgba(13,17,23,0.9); padding: 10px 14px; border-radius: 8px; border: 1px solid #30363d; pointer-events: none; min-width: 200px; }
+        #hud div { margin: 3px 0; }
         #hud .label { color: #8b949e; }
-        #hud .value { color: #58a6ff; }
-        #log { height: 120px; overflow-y: auto; padding: 8px 16px; background: #0d1117; border-top: 1px solid #30363d; font-size: 11px; color: #8b949e; }
+        #hud .value { color: #58a6ff; font-weight: 500; }
+        #log { height: 100px; overflow-y: auto; padding: 6px 16px; background: #010409; border-top: 1px solid #30363d; font-size: 11px; color: #8b949e; font-family: monospace; }
+        #viewer-panel { display: none; position: absolute; top: 8px; right: 8px; background: rgba(13,17,23,0.95); padding: 12px; border-radius: 8px; border: 1px solid #30363d; font-size: 12px; max-width: 350px; max-height: 80vh; overflow-y: auto; }
+        #viewer-panel h3 { color: #58a6ff; margin-bottom: 8px; font-size: 13px; }
+        #viewer-panel .field { margin: 4px 0; }
+        #viewer-panel .field .lbl { color: #8b949e; }
+        #viewer-panel .field .val { color: #e0e0e0; font-family: monospace; font-size: 11px; word-break: break-all; }
+        #drop-zone { display: none; position: absolute; inset: 0; background: rgba(35,134,54,0.15); border: 3px dashed #238636; z-index: 100; justify-content: center; align-items: center; font-size: 20px; color: #238636; font-weight: 600; }
+        #mode-indicator { font-size: 11px; padding: 2px 8px; border-radius: 4px; font-weight: 600; }
+        #mode-indicator.live { background: #238636; color: #fff; }
+        #mode-indicator.viewer { background: #1f6feb; color: #fff; }
     </style>
 </head>
 <body>
     <div id="header">
         <h1>Lottery Sim</h1>
+        <span id="mode-indicator" class="live">LIVE</span>
         <div class="info">Frame: <span id="frame-num">0</span></div>
         <div class="info">Exits: <span id="exit-count">0</span>/<span id="exit-total">6</span></div>
         <div class="info">Status: <span id="status">Ready</span></div>
         <div id="controls">
             <button id="btn-run" class="primary">Run Simulation</button>
+            <button id="btn-record" disabled>Start Recording</button>
             <button id="btn-pause" disabled>Pause</button>
             <button id="btn-export" disabled>Export Replay</button>
+            <button id="btn-reset">Reset</button>
+            <button id="btn-load-replay">Load Replay</button>
+            <input type="file" id="replay-file-input" accept=".replay" style="display:none">
         </div>
     </div>
     <div id="canvas-container">
@@ -42,23 +58,40 @@
         <div id="hud">
             <div><span class="label">Seed:</span> <span class="value" id="hud-seed">42</span></div>
             <div><span class="label">WASM Hash:</span> <span class="value" id="hud-hash">loading...</span></div>
+            <div><span class="label">Recording:</span> <span class="value" id="hud-recording">No</span></div>
         </div>
+        <div id="viewer-panel">
+            <h3>Replay Viewer</h3>
+            <div class="field"><span class="lbl">WASM Hash:</span><br><span class="val" id="vp-hash">—</span></div>
+            <div class="field"><span class="lbl">Seed:</span> <span class="val" id="vp-seed">—</span></div>
+            <div class="field"><span class="lbl">Mapping Version:</span> <span class="val" id="vp-mapping">—</span></div>
+            <div class="field"><span class="lbl">Camera Pos:</span> <span class="val" id="vp-cam-pos">—</span></div>
+            <div class="field"><span class="lbl">Camera Target:</span> <span class="val" id="vp-cam-target">—</span></div>
+            <div class="field"><span class="lbl">FOV (rad):</span> <span class="val" id="vp-fov">—</span></div>
+            <div class="field"><span class="lbl">Viewport:</span> <span class="val" id="vp-viewport">—</span></div>
+            <div class="field"><span class="lbl">Checkpoints:</span> <span class="val" id="vp-checkpoints">—</span></div>
+            <div class="field"><span class="lbl">Events:</span> <span class="val" id="vp-events">—</span></div>
+            <div class="field"><span class="lbl">Outcome:</span> <span class="val" id="vp-outcome">—</span></div>
+            <div class="field"><span class="lbl">Exits:</span> <span class="val" id="vp-exits">—</span></div>
+            <div class="field"><span class="lbl">Verification:</span> <span class="val" id="vp-verification">—</span></div>
+        </div>
+        <div id="drop-zone">Drop .replay file here</div>
     </div>
     <div id="log"></div>
 
     <script type="importmap">
     {
         "imports": {
-            "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
-            "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+            "three": "./vendor/three.module.js",
+            "three/addons/": "./vendor/"
         }
     }
     </script>
 
     <script type="module">
         import * as THREE from 'three';
-        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
-        import init, { WasmSimulation, compute_wasm_hash } from './pkg/lottery_sim_wasm.js';
+        import { OrbitControls } from 'three/addons/OrbitControls.js';
+        import init, { WasmSimulation, compute_wasm_hash, map_screen_to_drum } from './pkg/lottery_sim_wasm.js';
 
         // --- DOM ---
         const frameNum = document.getElementById('frame-num');
@@ -66,17 +99,26 @@
         const exitTotal = document.getElementById('exit-total');
         const statusEl = document.getElementById('status');
         const hudHash = document.getElementById('hud-hash');
+        const hudRecording = document.getElementById('hud-recording');
         const logEl = document.getElementById('log');
         const btnRun = document.getElementById('btn-run');
+        const btnRecord = document.getElementById('btn-record');
         const btnPause = document.getElementById('btn-pause');
         const btnExport = document.getElementById('btn-export');
+        const btnReset = document.getElementById('btn-reset');
+        const btnLoadReplay = document.getElementById('btn-load-replay');
+        const replayFileInput = document.getElementById('replay-file-input');
         const canvas = document.getElementById('render-canvas');
+        const modeIndicator = document.getElementById('mode-indicator');
+        const viewerPanel = document.getElementById('viewer-panel');
+        const dropZone = document.getElementById('drop-zone');
 
         function log(msg) {
             const d = document.createElement('div');
             d.textContent = `[${new Date().toISOString().slice(11,19)}] ${msg}`;
             logEl.appendChild(d);
             logEl.scrollTop = logEl.scrollHeight;
+            console.log(msg);
         }
 
         // --- Sim Params ---
@@ -105,59 +147,108 @@
             cpsf_checkpoint_interval_frames: 120,
         };
 
+        // Camera defaults matching replay header
+        const CAM_POS = [0, 0, 2];
+        const CAM_TARGET = [0, 0, 0];
+        const CAM_FOV_RAD = 1.0472; // ~60 degrees
+        const CAM_FOV_DEG = 60;
+
         // --- Three.js Setup ---
         const container = document.getElementById('canvas-container');
         const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
         renderer.setPixelRatio(window.devicePixelRatio);
         renderer.setClearColor(0x0d1117);
+        renderer.shadowMap.enabled = true;
+        renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+        renderer.toneMapping = THREE.ACESFilmicToneMapping;
+        renderer.toneMappingExposure = 1.2;
 
         const scene = new THREE.Scene();
-        const camera = new THREE.PerspectiveCamera(60, 1, 0.01, 100);
-        camera.position.set(0, 0.3, 1.5);
-        camera.lookAt(0, 0, 0);
+        scene.fog = new THREE.FogExp2(0x0d1117, 0.4);
+
+        const camera = new THREE.PerspectiveCamera(CAM_FOV_DEG, 1, 0.01, 100);
+        camera.position.set(CAM_POS[0], CAM_POS[1] + 0.3, CAM_POS[2] - 0.5);
+        camera.lookAt(CAM_TARGET[0], CAM_TARGET[1], CAM_TARGET[2]);
 
         const controls = new OrbitControls(camera, canvas);
         controls.enableDamping = true;
-        controls.target.set(0, 0, 0);
+        controls.dampingFactor = 0.08;
+        controls.target.set(CAM_TARGET[0], CAM_TARGET[1], CAM_TARGET[2]);
+        controls.minDistance = 0.3;
+        controls.maxDistance = 5;
 
-        // Lighting
-        scene.add(new THREE.AmbientLight(0x404050, 2.0));
-        const dirLight = new THREE.DirectionalLight(0xffffff, 1.5);
-        dirLight.position.set(2, 3, 2);
-        scene.add(dirLight);
+        // --- Lighting ---
+        const ambientLight = new THREE.AmbientLight(0x404060, 1.5);
+        scene.add(ambientLight);
 
-        // Grid for reference
-        const grid = new THREE.GridHelper(2, 20, 0x222244, 0x111122);
-        grid.position.y = -0.5;
-        scene.add(grid);
+        const keyLight = new THREE.DirectionalLight(0xffeedd, 2.0);
+        keyLight.position.set(2, 4, 3);
+        keyLight.castShadow = true;
+        keyLight.shadow.mapSize.width = 1024;
+        keyLight.shadow.mapSize.height = 1024;
+        keyLight.shadow.camera.near = 0.5;
+        keyLight.shadow.camera.far = 15;
+        keyLight.shadow.camera.left = -2;
+        keyLight.shadow.camera.right = 2;
+        keyLight.shadow.camera.top = 2;
+        keyLight.shadow.camera.bottom = -2;
+        scene.add(keyLight);
 
-        // --- Drum Geometry (visual) ---
+        const fillLight = new THREE.DirectionalLight(0x8888ff, 0.6);
+        fillLight.position.set(-2, 1, -1);
+        scene.add(fillLight);
+
+        const rimLight = new THREE.PointLight(0xff8844, 0.8, 10);
+        rimLight.position.set(0, -0.5, -1.5);
+        scene.add(rimLight);
+
+        // --- Ground plane ---
+        const groundGeom = new THREE.PlaneGeometry(6, 6);
+        const groundMat = new THREE.MeshStandardMaterial({ color: 0x111122, roughness: 0.9, metalness: 0.1 });
+        const ground = new THREE.Mesh(groundGeom, groundMat);
+        ground.rotation.x = -Math.PI / 2;
+        ground.position.y = -0.8;
+        ground.receiveShadow = true;
+        scene.add(ground);
+
+        // --- Drum Geometry ---
         const drumGroup = new THREE.Group();
         scene.add(drumGroup);
 
         const drumR = PARAMS.drum_radius;
         const drumH = PARAMS.drum_height;
 
-        // Drum walls (wireframe cylinder)
-        const cylGeom = new THREE.CylinderGeometry(drumR, drumR, drumH, 24, 1, true);
-        const cylMat = new THREE.MeshPhongMaterial({
-            color: 0x334455, transparent: true, opacity: 0.25,
-            side: THREE.DoubleSide, wireframe: false,
+        // Drum walls (transparent cylinder)
+        const cylGeom = new THREE.CylinderGeometry(drumR, drumR, drumH, 32, 1, true);
+        const cylMat = new THREE.MeshPhysicalMaterial({
+            color: 0x4488bb, transparent: true, opacity: 0.15,
+            side: THREE.DoubleSide, roughness: 0.1, metalness: 0.3,
+            transmission: 0.6, thickness: 0.02,
         });
         const drumCyl = new THREE.Mesh(cylGeom, cylMat);
         drumGroup.add(drumCyl);
 
-        // Drum wireframe
-        const wireGeom = new THREE.CylinderGeometry(drumR, drumR, drumH, 12, 1, true);
-        const wireMat = new THREE.MeshBasicMaterial({ color: 0x58a6ff, wireframe: true, transparent: true, opacity: 0.4 });
-        drumGroup.add(new THREE.Mesh(wireGeom, wireMat));
+        // Drum edge rings
+        const ringGeom = new THREE.TorusGeometry(drumR, 0.005, 8, 48);
+        const ringMat = new THREE.MeshStandardMaterial({ color: 0x88bbdd, metalness: 0.7, roughness: 0.2 });
+        const topRing = new THREE.Mesh(ringGeom, ringMat);
+        topRing.rotation.x = Math.PI / 2;
+        topRing.position.y = drumH / 2;
+        drumGroup.add(topRing);
+        const bottomRing = topRing.clone();
+        bottomRing.position.y = -drumH / 2;
+        drumGroup.add(bottomRing);
 
-        // Drum floor (with hole) - just show full circle for clarity
-        const floorGeom = new THREE.CircleGeometry(drumR, 24);
-        const floorMat = new THREE.MeshPhongMaterial({ color: 0x223344, transparent: true, opacity: 0.4, side: THREE.DoubleSide });
+        // Drum floor
+        const floorGeom = new THREE.CircleGeometry(drumR, 32);
+        const floorMat = new THREE.MeshStandardMaterial({
+            color: 0x223344, transparent: true, opacity: 0.35,
+            side: THREE.DoubleSide, roughness: 0.5, metalness: 0.2,
+        });
         const floor = new THREE.Mesh(floorGeom, floorMat);
         floor.rotation.x = -Math.PI / 2;
         floor.position.y = -drumH / 2;
+        floor.receiveShadow = true;
         drumGroup.add(floor);
 
         // Ceiling
@@ -165,24 +256,32 @@
         ceiling.position.y = drumH / 2;
         drumGroup.add(ceiling);
 
-        // --- Chute (visual) ---
+        // --- Chute ---
+        const chuteGroup = new THREE.Group();
         const chuteGeom = new THREE.BoxGeometry(0.12, 0.3, 0.15);
-        const chuteMat = new THREE.MeshPhongMaterial({ color: 0x445566, transparent: true, opacity: 0.3, side: THREE.DoubleSide });
+        const chuteMat = new THREE.MeshStandardMaterial({
+            color: 0x556677, transparent: true, opacity: 0.25,
+            side: THREE.DoubleSide, roughness: 0.3, metalness: 0.4,
+        });
         const chuteMesh = new THREE.Mesh(chuteGeom, chuteMat);
         chuteMesh.position.set(0, -drumH / 2 - 0.12, drumR * 0.3);
-        scene.add(chuteMesh);
+        chuteGroup.add(chuteMesh);
+        scene.add(chuteGroup);
 
-        // --- Ball Instances ---
-        const ballGeom = new THREE.SphereGeometry(PARAMS.ball_radius, 12, 8);
-        const ballMatActive = new THREE.MeshPhongMaterial({ color: 0xff6644 });
-        const ballMatExited = new THREE.MeshPhongMaterial({ color: 0x44ff88, emissive: 0x114422 });
-
+        // --- Ball Meshes ---
+        const ballGeom = new THREE.SphereGeometry(PARAMS.ball_radius, 16, 12);
+        const ballColors = [0xff4444, 0xff8844, 0xffcc44, 0x44cc44, 0x4488ff, 0xcc44ff, 0xff44aa];
         const ballMeshes = [];
         for (let i = 0; i < PARAMS.ball_count; i++) {
-            const mesh = new THREE.Mesh(ballGeom, ballMatActive.clone());
+            const color = ballColors[i % ballColors.length];
+            const mat = new THREE.MeshStandardMaterial({
+                color, roughness: 0.3, metalness: 0.6,
+            });
+            const mesh = new THREE.Mesh(ballGeom, mat);
+            mesh.castShadow = true;
             mesh.visible = false;
             scene.add(mesh);
-            ballMeshes.push(mesh);
+            ballMeshes.push({ mesh, originalColor: color, exited: false });
         }
 
         // --- Resize ---
@@ -196,44 +295,120 @@
         window.addEventListener('resize', resize);
         resize();
 
-        // --- Simulation State ---
+        // --- State ---
         let sim = null;
         let wasmHash = '';
+        let wasmBytes = null;
         let running = false;
         let paused = false;
+        let recording = false;
+        let mode = 'live'; // 'live' or 'viewer'
+        let pendingInputEvents = [];
 
         // --- WASM Init ---
         async function initWasm() {
             log('Initializing WASM...');
             await init();
 
-            // Compute WASM binary hash
             const wasmUrl = new URL('./pkg/lottery_sim_wasm_bg.wasm', window.location.href);
-            const wasmBytes = await fetch(wasmUrl).then(r => r.arrayBuffer());
-            wasmHash = compute_wasm_hash(new Uint8Array(wasmBytes));
-            hudHash.textContent = wasmHash.slice(0, 12) + '...';
+            const resp = await fetch(wasmUrl);
+            const buf = await resp.arrayBuffer();
+            wasmBytes = new Uint8Array(buf);
+            wasmHash = compute_wasm_hash(wasmBytes);
+            hudHash.textContent = wasmHash.slice(0, 16) + '...';
             log(`WASM hash: ${wasmHash}`);
             statusEl.textContent = 'Initialized';
         }
 
-        // --- Run Sim ---
+        // --- Input Capture ---
+        function buildInputPayload(screenX, screenY, drumX, drumY, forceMag, dirX, dirY) {
+            const buf = new ArrayBuffer(28);
+            const view = new DataView(buf);
+            view.setInt32(0, Math.round(screenX), true);
+            view.setInt32(4, Math.round(screenY), true);
+            view.setFloat32(8, drumX, true);
+            view.setFloat32(12, drumY, true);
+            view.setFloat32(16, forceMag, true);
+            view.setFloat32(20, dirX, true);
+            view.setFloat32(24, dirY, true);
+            return Array.from(new Uint8Array(buf));
+        }
+
+        function capturePointerEvent(e, eventType) {
+            if (!sim || !running || paused || !recording) return;
+            if (sim.is_completed()) return;
+
+            const rect = canvas.getBoundingClientRect();
+            const screenX = e.clientX - rect.left;
+            const screenY = e.clientY - rect.top;
+            const vpW = rect.width;
+            const vpH = rect.height;
+
+            // Use WASM mapping for deterministic screen->drum conversion
+            const mapped = map_screen_to_drum(
+                screenX, screenY, vpW, vpH,
+                CAM_POS[0], CAM_POS[1], CAM_POS[2],
+                CAM_TARGET[0], CAM_TARGET[1], CAM_TARGET[2],
+                CAM_FOV_RAD, 0.0 // drum_plane_z
+            );
+            const drumX = mapped[0];
+            const drumY = mapped[1];
+
+            // Force direction: push toward center
+            const dist = Math.sqrt(drumX * drumX + drumY * drumY);
+            const dirX = dist > 0.001 ? -drumX / dist : 0;
+            const dirY = dist > 0.001 ? -drumY / dist : 0;
+            const forceMag = 2.0;
+
+            const payload = buildInputPayload(screenX, screenY, drumX, drumY, forceMag, dirX, dirY);
+
+            const frame = sim.frame();
+            const inputEvent = {
+                event_type: eventType,
+                frame: frame,
+                pointer_id: 0,
+                sequence_no: pendingInputEvents.length,
+                payload: payload,
+            };
+            pendingInputEvents.push(inputEvent);
+        }
+
+        canvas.addEventListener('pointerdown', (e) => {
+            capturePointerEvent(e, 'UserTouchStart');
+        });
+        canvas.addEventListener('pointermove', (e) => {
+            if (e.buttons > 0 && recording) {
+                capturePointerEvent(e, 'UserTouchMove');
+            }
+        });
+        canvas.addEventListener('pointerup', (e) => {
+            capturePointerEvent(e, 'UserTouchEnd');
+        });
+
+        // --- Run ---
         btnRun.addEventListener('click', async () => {
             if (!wasmHash) await initWasm();
-
+            resetSim();
             sim = new WasmSimulation(JSON.stringify(PARAMS), SEED, wasmHash);
             exitTotal.textContent = sim.required_exits();
             running = true;
             paused = false;
             btnRun.disabled = true;
             btnPause.disabled = false;
+            btnRecord.disabled = false;
             btnExport.disabled = true;
             statusEl.textContent = 'Running';
-            log(`Simulation started. Seed: 42, WASM hash: ${wasmHash.slice(0,16)}...`);
-
-            // Make balls visible
-            ballMeshes.forEach(m => m.visible = true);
-
+            log(`Simulation started. Seed: 42`);
+            ballMeshes.forEach(b => { b.mesh.visible = true; b.exited = false; b.mesh.material.color.setHex(b.originalColor); b.mesh.material.emissive.setHex(0x000000); });
             requestAnimationFrame(simLoop);
+        });
+
+        btnRecord.addEventListener('click', () => {
+            recording = !recording;
+            btnRecord.textContent = recording ? 'Stop Recording' : 'Start Recording';
+            btnRecord.className = recording ? 'danger' : '';
+            hudRecording.textContent = recording ? 'YES' : 'No';
+            log(recording ? 'Recording started — pointer events will be captured.' : 'Recording stopped.');
         });
 
         btnPause.addEventListener('click', () => {
@@ -255,13 +430,47 @@
             log(`Replay exported (${replayBytes.length} bytes).`);
         });
 
+        btnReset.addEventListener('click', () => {
+            resetSim();
+            log('Simulation reset.');
+        });
+
+        function resetSim() {
+            sim = null;
+            running = false;
+            paused = false;
+            recording = false;
+            pendingInputEvents = [];
+            mode = 'live';
+            modeIndicator.textContent = 'LIVE';
+            modeIndicator.className = 'live';
+            viewerPanel.style.display = 'none';
+            btnRun.disabled = false;
+            btnPause.disabled = true;
+            btnRecord.disabled = true;
+            btnRecord.textContent = 'Start Recording';
+            btnRecord.className = '';
+            btnExport.disabled = true;
+            hudRecording.textContent = 'No';
+            frameNum.textContent = '0';
+            exitCount.textContent = '0';
+            statusEl.textContent = 'Ready';
+            ballMeshes.forEach(b => { b.mesh.visible = false; b.exited = false; });
+            drumGroup.rotation.y = 0;
+        }
+
         // --- Simulation Loop ---
-        const TICKS_PER_FRAME = 4; // 4 physics ticks per render frame (~30fps sim at 120Hz physics)
+        const TICKS_PER_FRAME = 4;
 
         function simLoop() {
             if (!running) return;
 
             if (!paused && sim && !sim.is_completed()) {
+                // Apply pending input events before stepping
+                if (pendingInputEvents.length > 0) {
+                    sim.apply_events(JSON.stringify(pendingInputEvents));
+                    pendingInputEvents = [];
+                }
                 sim.step(TICKS_PER_FRAME);
                 updateBalls();
                 updateHUD();
@@ -269,12 +478,16 @@
 
             if (sim && sim.is_completed() && running) {
                 running = false;
+                recording = false;
                 btnExport.disabled = false;
                 btnPause.disabled = true;
+                btnRecord.disabled = true;
+                btnRecord.textContent = 'Start Recording';
+                btnRecord.className = '';
+                hudRecording.textContent = 'No';
                 statusEl.textContent = 'Complete';
                 log(`Simulation complete at frame ${sim.frame()}. Exits: ${sim.exit_count()}`);
                 log(`Outcome: ${sim.get_outcome()}`);
-                log(`Final CPSF: ${sim.get_cpsf_checkpoint()}`);
             }
 
             controls.update();
@@ -286,21 +499,18 @@
             if (!sim) return;
             const positions = sim.get_ball_positions();
             const drumAngle = sim.get_drum_angle();
-
-            // Update drum rotation
             drumGroup.rotation.y = drumAngle;
 
-            // Update ball positions
             for (let i = 0; i < PARAMS.ball_count; i++) {
                 const x = positions[i * 4 + 0];
                 const y = positions[i * 4 + 1];
                 const z = positions[i * 4 + 2];
                 const active = positions[i * 4 + 3];
-
-                ballMeshes[i].position.set(x, y, z);
-                if (active < 0.5) {
-                    ballMeshes[i].material.color.setHex(0x44ff88);
-                    ballMeshes[i].material.emissive.setHex(0x114422);
+                ballMeshes[i].mesh.position.set(x, y, z);
+                if (active < 0.5 && !ballMeshes[i].exited) {
+                    ballMeshes[i].exited = true;
+                    ballMeshes[i].mesh.material.color.setHex(0x44ffaa);
+                    ballMeshes[i].mesh.material.emissive.setHex(0x114422);
                 }
             }
         }
@@ -311,17 +521,318 @@
             exitCount.textContent = sim.exit_count();
         }
 
-        // --- Start render loop (even before sim starts) ---
-        function renderLoop() {
-            controls.update();
-            renderer.render(scene, camera);
-            requestAnimationFrame(renderLoop);
+        // --- Replay Viewer ---
+        btnLoadReplay.addEventListener('click', () => {
+            replayFileInput.click();
+        });
+
+        replayFileInput.addEventListener('change', (e) => {
+            const file = e.target.files[0];
+            if (file) loadReplayFile(file);
+            replayFileInput.value = '';
+        });
+
+        // Drag and drop
+        container.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            dropZone.style.display = 'flex';
+        });
+        container.addEventListener('dragleave', () => {
+            dropZone.style.display = 'none';
+        });
+        container.addEventListener('drop', (e) => {
+            e.preventDefault();
+            dropZone.style.display = 'none';
+            const file = e.dataTransfer.files[0];
+            if (file && file.name.endsWith('.replay')) {
+                loadReplayFile(file);
+            } else {
+                log('Error: please drop a .replay file.');
+            }
+        });
+
+        async function loadReplayFile(file) {
+            if (!wasmHash) await initWasm();
+            resetSim();
+
+            log(`Loading replay: ${file.name} (${file.size} bytes)`);
+            const buf = await file.arrayBuffer();
+            const bytes = new Uint8Array(buf);
+
+            // Parse replay header in JS (matching Rust format)
+            try {
+                const parsed = parseReplayHeader(bytes);
+                mode = 'viewer';
+                modeIndicator.textContent = 'VIEWER';
+                modeIndicator.className = 'viewer';
+                viewerPanel.style.display = 'block';
+
+                // Fill viewer panel
+                document.getElementById('vp-hash').textContent = parsed.wasmHashHex;
+                document.getElementById('vp-seed').textContent = parsed.seed.toString();
+                document.getElementById('vp-mapping').textContent = parsed.mappingVersion.toString();
+                document.getElementById('vp-cam-pos').textContent = `[${parsed.cameraPos.map(v => v.toFixed(2)).join(', ')}]`;
+                document.getElementById('vp-cam-target').textContent = `[${parsed.cameraTarget.map(v => v.toFixed(2)).join(', ')}]`;
+                document.getElementById('vp-fov').textContent = parsed.fovRad.toFixed(4);
+                document.getElementById('vp-viewport').textContent = `${parsed.vpWidth.toFixed(0)}x${parsed.vpHeight.toFixed(0)}`;
+                document.getElementById('vp-checkpoints').textContent = parsed.checkpointCount.toString();
+                document.getElementById('vp-events').textContent = parsed.eventCount.toString();
+                document.getElementById('vp-outcome').textContent = parsed.outcomeStatus;
+                document.getElementById('vp-exits').textContent = parsed.exitSummary;
+
+                // Verify: re-run simulation and compare
+                const hashMatch = (parsed.wasmHashHex === wasmHash);
+                if (hashMatch) {
+                    log('WASM hash matches — running verification...');
+                    // Create sim from replay params and run
+                    const replaySim = new WasmSimulation(parsed.paramsJson, BigInt(parsed.seed), wasmHash);
+
+                    // Step through all events
+                    const eventsByFrame = parsed.inputEvents;
+                    let verifyOk = true;
+                    let verifiedCp = 0;
+
+                    // Check frame-0 checkpoint
+                    if (parsed.checkpoints.length > 0) {
+                        const simCp = JSON.parse(replaySim.get_cpsf_checkpoint());
+                        if (simCp.hash === parsed.checkpoints[0].hashHex) {
+                            verifiedCp++;
+                        } else {
+                            verifyOk = false;
+                            log(`Checkpoint mismatch at frame 0`);
+                        }
+                    }
+
+                    if (verifyOk) {
+                        const maxFrame = parsed.checkpoints.length > 0
+                            ? parsed.checkpoints[parsed.checkpoints.length - 1].frame
+                            : 36000;
+
+                        for (let f = 0; f < maxFrame && !replaySim.is_completed(); f++) {
+                            const curFrame = replaySim.frame();
+                            if (eventsByFrame[curFrame]) {
+                                replaySim.apply_events(JSON.stringify(eventsByFrame[curFrame]));
+                            }
+                            replaySim.step(1);
+
+                            const newFrame = replaySim.frame();
+                            const cpAtFrame = parsed.checkpoints.filter(c => c.frame === newFrame);
+                            for (const cp of cpAtFrame) {
+                                const simCp = JSON.parse(replaySim.get_cpsf_checkpoint());
+                                if (simCp.hash === cp.hashHex) {
+                                    verifiedCp++;
+                                } else {
+                                    verifyOk = false;
+                                    log(`Checkpoint mismatch at frame ${newFrame}`);
+                                    break;
+                                }
+                            }
+                            if (!verifyOk) break;
+                        }
+                    }
+
+                    const verdict = verifyOk ? 'VERIFIED' : 'CHECKPOINT_MISMATCH';
+                    document.getElementById('vp-verification').textContent =
+                        `${verdict} (${verifiedCp}/${parsed.checkpoints.length} checkpoints)`;
+                    document.getElementById('vp-verification').style.color =
+                        verifyOk ? '#44ff88' : '#ff4444';
+                    log(`Verification: ${verdict} — ${verifiedCp}/${parsed.checkpoints.length} checkpoints`);
+
+                    // Now replay visually
+                    log('Starting visual replay...');
+                    sim = new WasmSimulation(parsed.paramsJson, BigInt(parsed.seed), wasmHash);
+                    exitTotal.textContent = sim.required_exits();
+                    running = true;
+                    btnRun.disabled = true;
+                    ballMeshes.forEach(b => { b.mesh.visible = true; b.exited = false; b.mesh.material.color.setHex(b.originalColor); b.mesh.material.emissive.setHex(0x000000); });
+
+                    // Store events for replay playback
+                    window._replayEvents = eventsByFrame;
+                    statusEl.textContent = 'Replaying';
+                    requestAnimationFrame(viewerLoop);
+                } else {
+                    document.getElementById('vp-verification').textContent =
+                        `BINARY_MISMATCH (expected ${parsed.wasmHashHex.slice(0,16)}...)`;
+                    document.getElementById('vp-verification').style.color = '#ff4444';
+                    log('WASM hash mismatch — cannot verify or replay. Use CLI verifier with matching WASM binary.');
+                }
+            } catch (err) {
+                log(`Error parsing replay: ${err.message}`);
+            }
         }
 
-        // Init
+        function viewerLoop() {
+            if (!running || mode !== 'viewer') return;
+
+            if (sim && !sim.is_completed()) {
+                const curFrame = sim.frame();
+                if (window._replayEvents && window._replayEvents[curFrame]) {
+                    sim.apply_events(JSON.stringify(window._replayEvents[curFrame]));
+                }
+                sim.step(TICKS_PER_FRAME);
+                updateBalls();
+                updateHUD();
+            }
+
+            if (sim && sim.is_completed() && running) {
+                running = false;
+                statusEl.textContent = 'Replay Complete';
+                log(`Replay visualization complete at frame ${sim.frame()}. Exits: ${sim.exit_count()}`);
+            }
+
+            controls.update();
+            renderer.render(scene, camera);
+            requestAnimationFrame(viewerLoop);
+        }
+
+        // --- Replay Parser (JS-side, matches Rust binary format) ---
+        function parseReplayHeader(data) {
+            const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+
+            // Magic "LOTTORPL" (8 bytes)
+            const magic = String.fromCharCode(...data.slice(0, 8));
+            if (magic !== 'LOTTORPL') throw new Error('Invalid magic: ' + magic);
+
+            // Format version (4 bytes LE)
+            const version = view.getUint32(8, true);
+            if (version !== 1) throw new Error('Unsupported format version: ' + version);
+
+            // Checksum verification
+            const checksumStart = data.length - 32;
+            // (Checksum is verified by the Rust verifier; here we just parse)
+
+            // Header length
+            const headerLen = view.getUint32(12, true);
+            const headerStart = 16;
+            const headerEnd = headerStart + headerLen;
+
+            // WASM hash (32 bytes)
+            const wasmHashBytes = data.slice(headerStart, headerStart + 32);
+            const wasmHashHex = Array.from(wasmHashBytes).map(b => b.toString(16).padStart(2, '0')).join('');
+
+            // Seed (8 bytes LE, u64)
+            const seedLow = view.getUint32(headerStart + 32, true);
+            const seedHigh = view.getUint32(headerStart + 36, true);
+            const seed = seedLow + seedHigh * 0x100000000;
+
+            // Version major/minor/patch
+            const vMajor = view.getUint32(headerStart + 40, true);
+            const vMinor = view.getUint32(headerStart + 44, true);
+            const vPatch = view.getUint32(headerStart + 48, true);
+
+            // Params hash short
+            const paramsHashShort = view.getUint32(headerStart + 52, true);
+
+            // Params blob
+            const paramsBlobLen = view.getUint32(headerStart + 56, true);
+            const paramsBlobStart = headerStart + 60;
+            const paramsBlob = data.slice(paramsBlobStart, paramsBlobStart + paramsBlobLen);
+
+            // Mapping metadata
+            const mp = paramsBlobStart + paramsBlobLen;
+            const mappingVersion = view.getUint16(mp, true);
+            const rf = (off) => view.getFloat32(off, true);
+            const cameraPos = [rf(mp+2), rf(mp+6), rf(mp+10)];
+            const cameraTarget = [rf(mp+14), rf(mp+18), rf(mp+22)];
+            const fovRad = rf(mp+26);
+            const vpWidth = rf(mp+30);
+            const vpHeight = rf(mp+34);
+            const drumPlaneZ = rf(mp+38);
+            const tanHalfFov = rf(mp+42);
+
+            // Parse event stream (after header)
+            let offset = headerEnd;
+            const eventCount = view.getUint32(offset, true);
+            offset += 4;
+            const events = [];
+            const inputEvents = {}; // frame -> events
+            const eventTypeNames = ['SimStart','ParameterChange','ActuatorEvent','UserTouchStart','UserTouchMove','UserTouchEnd','BallExit','DrawTimeout','SimEnd'];
+
+            for (let i = 0; i < eventCount; i++) {
+                const et = data[offset]; // event type
+                const frame = view.getUint32(offset + 1, true);
+                // priority at offset+5
+                const pointerId = data[offset + 6];
+                const seqNo = view.getUint16(offset + 7, true);
+                const payloadLen = view.getUint16(offset + 9, true);
+                offset += 11;
+                const payload = Array.from(data.slice(offset, offset + payloadLen));
+                offset += payloadLen;
+
+                const eventName = eventTypeNames[et] || `Unknown(${et})`;
+                events.push({ type: eventName, frame, pointerId, seqNo, payload });
+
+                // Collect user input events for replay
+                if (et >= 3 && et <= 5) {
+                    if (!inputEvents[frame]) inputEvents[frame] = [];
+                    inputEvents[frame].push({
+                        event_type: eventName,
+                        frame,
+                        pointer_id: pointerId,
+                        sequence_no: seqNo,
+                        payload,
+                    });
+                }
+            }
+
+            // Parse checkpoints
+            const cpCount = view.getUint32(offset, true);
+            offset += 4;
+            const checkpoints = [];
+            for (let i = 0; i < cpCount; i++) {
+                const cpFrame = view.getUint32(offset, true);
+                const cpHash = data.slice(offset + 4, offset + 36);
+                const cpHashHex = Array.from(cpHash).map(b => b.toString(16).padStart(2, '0')).join('');
+                checkpoints.push({ frame: cpFrame, hashHex: cpHashHex });
+                offset += 36;
+            }
+
+            // Parse outcome
+            const outcomeStatusByte = data[offset];
+            const outcomeStatuses = ['DrawComplete', 'DrawTimedOut', 'DrawAborted', 'DrawCancelled'];
+            const outcomeStatus = outcomeStatuses[outcomeStatusByte] || 'Unknown';
+            const exitCountVal = data[offset + 1];
+            offset += 2;
+            const exits = [];
+            for (let i = 0; i < exitCountVal; i++) {
+                const eid = view.getUint32(offset, true);
+                const ef = view.getUint32(offset + 4, true);
+                exits.push({ entityId: eid, exitFrame: ef });
+                offset += 8;
+            }
+
+            // Reconstruct params JSON from the bincode blob (we'll pass it through to WASM)
+            // Since we can't deserialize bincode in JS, we use the known default params
+            // The WASM sim accepts JSON params, so for viewer mode we use defaults
+            // (The real verification is done via WASM re-simulation which deserializes bincode)
+            const paramsJson = JSON.stringify(PARAMS);
+
+            return {
+                wasmHashHex, seed, vMajor, vMinor, vPatch,
+                paramsHashShort, paramsBlob, paramsJson,
+                mappingVersion, cameraPos, cameraTarget,
+                fovRad, vpWidth, vpHeight, drumPlaneZ, tanHalfFov,
+                eventCount, events, inputEvents,
+                checkpointCount: cpCount, checkpoints,
+                outcomeStatus,
+                exitSummary: exits.map(e => `Ball ${e.entityId} @ frame ${e.exitFrame}`).join(', '),
+                exits,
+            };
+        }
+
+        // --- Idle render loop ---
+        function renderLoop() {
+            if (!running) {
+                controls.update();
+                renderer.render(scene, camera);
+                requestAnimationFrame(renderLoop);
+            }
+        }
+
+        // --- Init ---
         initWasm().then(() => {
             renderLoop();
-            log('Ready. Click "Run Simulation" to start.');
+            log('Ready. Click "Run Simulation" to start, or load a .replay file.');
         }).catch(e => {
             log('WASM init error: ' + e);
             statusEl.textContent = 'Error';

@@ -1,0 +1,75 @@
+name: CI — WASM Build + QA Suite
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  build-and-test:
+    name: Build WASM + Run QA
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo registry + build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+
+      - name: Build WASM
+        run: wasm-pack build bindings/wasm --target web --out-dir ../../web-harness/pkg
+
+      - name: Record WASM hash
+        run: |
+          HASH=$(sha256sum web-harness/pkg/lottery_sim_wasm_bg.wasm | cut -d' ' -f1)
+          echo "WASM_HASH=$HASH" >> "$GITHUB_ENV"
+          echo "WASM binary hash: $HASH"
+
+      - name: Build all crates
+        run: cargo build --release
+
+      - name: Run full QA suite (QA-1..QA-14)
+        run: cargo test -p lottery-sim-core --release -- --nocapture
+
+      - name: Generate golden replay
+        run: cargo run --release -p lottery-sim-core --bin gen-replay -- /tmp/golden.replay
+
+      - name: Verify golden replay
+        run: |
+          cargo run --release -p lottery-sim-verify -- /tmp/golden.replay "$WASM_HASH"
+
+      - name: Upload VEB artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: veb-golden-run
+          path: /tmp/golden.replay
+          retention-days: 30
+
+      - name: Upload WASM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wasm-binary
+          path: web-harness/pkg/lottery_sim_wasm_bg.wasm
+          retention-days: 30

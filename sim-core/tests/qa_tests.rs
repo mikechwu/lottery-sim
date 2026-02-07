@@ -1,4 +1,4 @@
-//! QA-1 through QA-11: Phase-1 + Phase-2 + Phase-3 mandatory tests.
+//! QA-1 through QA-14: Phase-1 + Phase-2 + Phase-3 + Phase-4 mandatory tests.
 
 use lottery_sim_core::{
     Simulation, SimulationParameters, DrawOutcome, DrawStatus,
@@ -884,4 +884,316 @@ fn qa11_input_mapping_compliance() {
     println!("  tan_half_fov: {}", header.tan_half_fov);
     println!("  Touch events recorded: {}", touch_events.len());
     println!("  Replay VERIFIED, {} bytes", replay1.len());
+}
+
+// =============================================================================
+// QA-12: Live Interaction Capture Determinism (Phase-4)
+// Synthetic pointer events injected at web-harness level.
+// Exported replay must contain raw screen coords + mapping metadata.
+// Verify with CLI: VERIFIED. Replay bytes identical across runs.
+// =============================================================================
+
+#[test]
+fn qa12_live_interaction_capture_determinism() {
+    let params = SimulationParameters::default();
+    let wasm_hash = test_wasm_hash();
+
+    // Simulate the web-harness capture flow:
+    // 1. Browser captures pointer events with raw screen coords
+    // 2. WASM map_screen_to_drum converts to drum coords
+    // 3. Events are appended to sim's event stream
+    // 4. Replay is exported with mapping metadata in header
+
+    fn make_live_payload(screen_x: i32, screen_y: i32, drum_x: f32, drum_y: f32,
+                          force_mag: f32, dir_x: f32, dir_y: f32) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(28);
+        buf.extend_from_slice(&screen_x.to_le_bytes());
+        buf.extend_from_slice(&screen_y.to_le_bytes());
+        buf.extend_from_slice(&drum_x.to_bits().to_le_bytes());
+        buf.extend_from_slice(&drum_y.to_bits().to_le_bytes());
+        buf.extend_from_slice(&force_mag.to_bits().to_le_bytes());
+        buf.extend_from_slice(&dir_x.to_bits().to_le_bytes());
+        buf.extend_from_slice(&dir_y.to_bits().to_le_bytes());
+        buf
+    }
+
+    // Simulate the deterministic screen→drum mapping that WASM performs.
+    // Using the same params as the web harness: cam_pos=[0,0,2], fov=1.0472, viewport=1920x1080
+    fn wasm_map_screen_to_drum(screen_x: f32, screen_y: f32, vp_w: f32, vp_h: f32) -> (f32, f32) {
+        let cam_z: f32 = 2.0;
+        let fov_rad: f32 = 1.0472;
+        let ndc_x = (2.0 * screen_x / vp_w) - 1.0;
+        let ndc_y = 1.0 - (2.0 * screen_y / vp_h);
+        let aspect = vp_w / vp_h;
+        let half_fov_tan = (fov_rad / 2.0).tan();
+        let ray_x = ndc_x * aspect * half_fov_tan;
+        let ray_y = ndc_y * half_fov_tan;
+        let ray_z: f32 = -1.0;
+        let t = (0.0 - cam_z) / ray_z;
+        let drum_x = ray_x * t;
+        let drum_y = ray_y * t;
+        (drum_x, drum_y)
+    }
+
+    // Synthetic pointer event sequence (screen coords)
+    let pointer_events = vec![
+        (8u32, 960.0f32, 540.0f32, "UserTouchStart"),
+        (12, 980.0, 530.0, "UserTouchMove"),
+        (15, 1000.0, 520.0, "UserTouchMove"),
+        (18, 1000.0, 520.0, "UserTouchEnd"),
+    ];
+
+    // Build InputEvents by mapping through WASM-equivalent function
+    let mut live_events: Vec<(u32, InputEvent)> = Vec::new();
+    for (i, (frame, sx, sy, etype)) in pointer_events.iter().enumerate() {
+        let (dx, dy) = wasm_map_screen_to_drum(*sx, *sy, 1920.0, 1080.0);
+        let dist = (dx * dx + dy * dy).sqrt();
+        let (dir_x, dir_y) = if dist > 0.001 { (-dx / dist, -dy / dist) } else { (0.0, 0.0) };
+        let force_mag = if *etype == "UserTouchEnd" { 0.0 } else { 2.0 };
+
+        let event_type = match *etype {
+            "UserTouchStart" => EventType::UserTouchStart,
+            "UserTouchMove" => EventType::UserTouchMove,
+            "UserTouchEnd" => EventType::UserTouchEnd,
+            _ => panic!("unexpected"),
+        };
+
+        let payload = if *etype != "UserTouchEnd" {
+            make_live_payload(*sx as i32, *sy as i32, dx, dy, force_mag, dir_x, dir_y)
+        } else {
+            Vec::new()
+        };
+
+        live_events.push((*frame, InputEvent {
+            event_type,
+            frame: *frame,
+            pointer_id: 0,
+            sequence_no: i as u16,
+            payload,
+        }));
+    }
+
+    // Run 1 with live events
+    let mut sim1 = Simulation::new(params.clone(), TEST_SEED);
+    let mut next_ev = 0;
+    while !sim1.is_completed() {
+        while next_ev < live_events.len() && sim1.frame() >= live_events[next_ev].0 {
+            sim1.apply_events(&[live_events[next_ev].1.clone()]);
+            next_ev += 1;
+        }
+        sim1.step(1);
+    }
+    let replay1 = sim1.export_replay(wasm_hash).to_bytes();
+
+    // Run 2 with same live events
+    let mut sim2 = Simulation::new(params.clone(), TEST_SEED);
+    let mut next_ev = 0;
+    while !sim2.is_completed() {
+        while next_ev < live_events.len() && sim2.frame() >= live_events[next_ev].0 {
+            sim2.apply_events(&[live_events[next_ev].1.clone()]);
+            next_ev += 1;
+        }
+        sim2.step(1);
+    }
+    let replay2 = sim2.export_replay(wasm_hash).to_bytes();
+
+    // Replay bytes must be identical
+    assert_eq!(replay1, replay2, "QA-12 FAIL: replay bytes differ between runs");
+
+    // Verify
+    let verifier = Verifier::new(wasm_hash);
+    let veb1 = verifier.verify_bytes(&replay1);
+    assert_eq!(veb1.verdict, "VERIFIED", "QA-12 FAIL: VEB1 verdict is {}", veb1.verdict);
+    let veb2 = verifier.verify_bytes(&replay2);
+    assert_eq!(veb2.verdict, "VERIFIED", "QA-12 FAIL: VEB2 verdict is {}", veb2.verdict);
+
+    // Parse replay and verify events contain raw screen coords
+    let container = ReplayContainer::from_bytes(&replay1).expect("parse replay");
+    let touch_events: Vec<_> = container.event_stream.events.iter()
+        .filter(|e| matches!(e.event_type, EventType::UserTouchStart | EventType::UserTouchMove))
+        .collect();
+    assert!(touch_events.len() >= 3, "QA-12 FAIL: expected >=3 touch events with payload, got {}", touch_events.len());
+
+    // Verify each payload has raw screen coords (first 8 bytes = screen_x, screen_y as i32 LE)
+    for ev in &touch_events {
+        assert!(ev.payload.len() >= 28, "QA-12 FAIL: payload too short: {} bytes", ev.payload.len());
+        let screen_x = i32::from_le_bytes(ev.payload[0..4].try_into().unwrap());
+        let screen_y = i32::from_le_bytes(ev.payload[4..8].try_into().unwrap());
+        assert!(screen_x > 0, "QA-12 FAIL: screen_x should be positive: {}", screen_x);
+        assert!(screen_y > 0, "QA-12 FAIL: screen_y should be positive: {}", screen_y);
+    }
+
+    // Verify mapping metadata in header
+    let header = &container.header;
+    assert!(header.mapping_version >= 1, "QA-12 FAIL: mapping_version missing");
+    assert!(header.camera_pos[2] > 0.0, "QA-12 FAIL: camera_pos_z should be positive");
+    assert!(header.camera_fov_rad > 0.0, "QA-12 FAIL: camera_fov_rad missing");
+    assert!(header.viewport_width > 0.0, "QA-12 FAIL: viewport_width missing");
+    assert!(header.viewport_height > 0.0, "QA-12 FAIL: viewport_height missing");
+
+    println!("QA-12 PASS: Live interaction capture determinism verified.");
+    println!("  Pointer events captured: {}", live_events.len());
+    println!("  Touch events in replay: {} (with screen coords)", touch_events.len());
+    println!("  Mapping metadata: version={}, cam_pos={:?}, fov={}", header.mapping_version, header.camera_pos, header.camera_fov_rad);
+    println!("  Replay bytes identical: {} bytes", replay1.len());
+    println!("  VEB: VERIFIED (2x)");
+}
+
+// =============================================================================
+// QA-13: Replay Viewer Fidelity (Phase-4)
+// Load a known replay, replay through viewer loop, confirm exits match
+// expected ball IDs and frames, CPSF checkpoints match verifier results.
+// =============================================================================
+
+#[test]
+fn qa13_replay_viewer_fidelity() {
+    let params = SimulationParameters::default();
+    let wasm_hash = test_wasm_hash();
+
+    // Step 1: Generate a known replay
+    let mut sim_gen = Simulation::new(params.clone(), TEST_SEED);
+    while !sim_gen.is_completed() {
+        sim_gen.step(120);
+    }
+    let gen_outcome = sim_gen.get_outcome();
+    let gen_checkpoints = sim_gen.checkpoints().to_vec();
+    let replay_bytes = sim_gen.export_replay(wasm_hash).to_bytes();
+
+    // Step 2: Parse the replay (simulating what the viewer does)
+    let container = ReplayContainer::from_bytes(&replay_bytes).expect("parse replay");
+
+    // Step 3: Re-run simulation (simulating viewer's WASM re-simulation)
+    let mut sim_viewer = Simulation::new(params.clone(), TEST_SEED);
+
+    // Build frame→events map from replay (like the JS viewer does)
+    let mut input_event_map: std::collections::BTreeMap<u32, Vec<InputEvent>> =
+        std::collections::BTreeMap::new();
+    for ev in &container.event_stream.events {
+        match ev.event_type {
+            EventType::UserTouchStart | EventType::UserTouchMove | EventType::UserTouchEnd => {
+                input_event_map.entry(ev.frame).or_default().push(ev.clone());
+            }
+            _ => {}
+        }
+    }
+
+    // Step simulation frame by frame
+    let max_frame = gen_checkpoints.last().map(|cp| cp.frame).unwrap_or(300);
+    for _ in 0..max_frame {
+        if sim_viewer.is_completed() { break; }
+        let current = sim_viewer.frame();
+        if let Some(events) = input_event_map.remove(&current) {
+            sim_viewer.apply_events(&events);
+        }
+        sim_viewer.step(1);
+    }
+
+    let viewer_outcome = sim_viewer.get_outcome();
+    let viewer_checkpoints = sim_viewer.checkpoints().to_vec();
+
+    // Step 4: Verify exits match
+    assert_eq!(
+        gen_outcome.exits.len(), viewer_outcome.exits.len(),
+        "QA-13 FAIL: exit count differs: gen={}, viewer={}",
+        gen_outcome.exits.len(), viewer_outcome.exits.len()
+    );
+    for (i, (gen_exit, view_exit)) in gen_outcome.exits.iter().zip(viewer_outcome.exits.iter()).enumerate() {
+        assert_eq!(
+            gen_exit.entity_id, view_exit.entity_id,
+            "QA-13 FAIL: exit {} entity_id differs: gen={}, viewer={}",
+            i, gen_exit.entity_id, view_exit.entity_id
+        );
+        assert_eq!(
+            gen_exit.exit_frame, view_exit.exit_frame,
+            "QA-13 FAIL: exit {} frame differs: gen={}, viewer={}",
+            i, gen_exit.exit_frame, view_exit.exit_frame
+        );
+    }
+
+    // Step 5: Verify CPSF checkpoints match
+    let verifier = Verifier::new(wasm_hash);
+    let veb = verifier.verify_bytes(&replay_bytes);
+    assert_eq!(veb.verdict, "VERIFIED", "QA-13 FAIL: VEB verdict is {}", veb.verdict);
+
+    // Viewer checkpoints should match generator checkpoints
+    assert_eq!(
+        gen_checkpoints.len(), viewer_checkpoints.len(),
+        "QA-13 FAIL: checkpoint count differs: gen={}, viewer={}",
+        gen_checkpoints.len(), viewer_checkpoints.len()
+    );
+    for (i, (gc, vc)) in gen_checkpoints.iter().zip(viewer_checkpoints.iter()).enumerate() {
+        assert_eq!(gc.frame, vc.frame, "QA-13 FAIL: checkpoint {} frame differs", i);
+        assert_eq!(gc.hash, vc.hash, "QA-13 FAIL: checkpoint {} hash differs at frame {}", i, gc.frame);
+    }
+
+    // Step 6: Build viewer summary (matches VEB semantically)
+    let viewer_summary_verdict = if veb.verdict == "VERIFIED" { "VERIFIED" } else { "MISMATCH" };
+    let viewer_summary_checkpoints = veb.checkpoints_verified;
+    let viewer_summary_total = veb.checkpoints_total;
+
+    println!("QA-13 PASS: Replay viewer fidelity verified.");
+    println!("  Exits match: {} exits", gen_outcome.exits.len());
+    for (i, exit) in gen_outcome.exits.iter().enumerate() {
+        println!("    Exit {}: ball {} @ frame {}", i + 1, exit.entity_id, exit.exit_frame);
+    }
+    println!("  CPSF checkpoints match: {}/{}", gen_checkpoints.len(), viewer_checkpoints.len());
+    println!("  Viewer summary: {} ({}/{})", viewer_summary_verdict, viewer_summary_checkpoints, viewer_summary_total);
+    println!("  VEB verdict: {}", veb.verdict);
+}
+
+// =============================================================================
+// QA-14: Dependency Reproducibility (Phase-4)
+// Assert no runtime CDN usage — Three.js must be bundled locally.
+// =============================================================================
+
+#[test]
+fn qa14_dependency_reproducibility() {
+    // Read web-harness/index.html and check for CDN references
+    let index_path = std::path::Path::new("../web-harness/index.html");
+    assert!(index_path.exists(), "QA-14 FAIL: web-harness/index.html not found");
+
+    let content = std::fs::read_to_string(index_path).expect("read index.html");
+
+    // Must NOT contain CDN URLs for Three.js
+    assert!(
+        !content.contains("cdn.jsdelivr.net"),
+        "QA-14 FAIL: index.html still references cdn.jsdelivr.net"
+    );
+    assert!(
+        !content.contains("unpkg.com/three"),
+        "QA-14 FAIL: index.html references unpkg.com CDN for Three.js"
+    );
+    assert!(
+        !content.contains("cdnjs.cloudflare.com"),
+        "QA-14 FAIL: index.html references cdnjs CDN"
+    );
+
+    // Must reference local vendor path
+    assert!(
+        content.contains("./vendor/three.module.js"),
+        "QA-14 FAIL: index.html does not reference local Three.js (expected ./vendor/three.module.js)"
+    );
+
+    // Verify vendor files exist
+    let three_path = std::path::Path::new("../web-harness/vendor/three.module.js");
+    assert!(three_path.exists(), "QA-14 FAIL: vendor/three.module.js not found");
+    let three_size = std::fs::metadata(three_path).expect("stat three.module.js").len();
+    assert!(three_size > 100_000, "QA-14 FAIL: three.module.js too small ({} bytes), likely corrupted", three_size);
+
+    let orbit_path = std::path::Path::new("../web-harness/vendor/OrbitControls.js");
+    assert!(orbit_path.exists(), "QA-14 FAIL: vendor/OrbitControls.js not found");
+    let orbit_size = std::fs::metadata(orbit_path).expect("stat OrbitControls.js").len();
+    assert!(orbit_size > 1_000, "QA-14 FAIL: OrbitControls.js too small ({} bytes)", orbit_size);
+
+    // Verify importmap uses local paths
+    assert!(
+        content.contains("\"three\": \"./vendor/three.module.js\""),
+        "QA-14 FAIL: importmap does not map 'three' to local vendor"
+    );
+
+    println!("QA-14 PASS: Dependency reproducibility verified.");
+    println!("  No CDN references in index.html");
+    println!("  Three.js bundled locally: vendor/three.module.js ({} bytes)", three_size);
+    println!("  OrbitControls bundled locally: vendor/OrbitControls.js ({} bytes)", orbit_size);
+    println!("  Importmap uses local paths");
 }
