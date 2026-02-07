@@ -2,8 +2,11 @@ use rand::prelude::*;
 use rand_pcg::Pcg64;
 use std::collections::BTreeMap;
 
+use rapier3d::prelude::*;
+use glam::Vec3;
+
 use crate::cpsf::{BodyState, Cpsf, CpsfCheckpoint};
-use crate::event::{EventStream, EventType, InputEvent};
+use crate::event::{EventStream, EventType, InputEvent, UserInputPayload};
 use crate::outcome::{BallExit, DrawOutcome, DrawStatus};
 use crate::params::SimulationParameters;
 
@@ -17,38 +20,57 @@ fn domain_seed(master_seed: u64, domain: &str) -> u64 {
     u64::from_le_bytes(hash[0..8].try_into().unwrap())
 }
 
-/// Ball state for the placeholder physics.
+/// Tracked ball metadata (entity_id mapping to Rapier handle).
 #[derive(Debug, Clone)]
-struct Ball {
+struct BallInfo {
     entity_id: u32,
-    position: [f32; 3],
-    velocity: [f32; 3],
+    body_handle: RigidBodyHandle,
     active: bool,
     exit_frame: Option<u32>,
-    /// Frozen position for CPSF after exit (v4 §C.3).
     frozen_position: Option<[f32; 3]>,
+    frozen_orientation: Option<[f32; 4]>,
 }
 
-/// Deterministic simulation engine.
-/// Uses placeholder physics (gravity + boundary bounce) — adequate for
-/// Phase-1 foundation. Real Rapier integration deferred to Phase-2.
+/// Deterministic simulation engine with Rapier 3D physics.
+/// Phase-2: real rigid-body physics with drum rotation and chute geometry.
 pub struct Simulation {
     params: SimulationParameters,
     seed: u64,
     frame: u32,
-    balls: Vec<Ball>,
+
+    // Rapier physics state.
+    pipeline: PhysicsPipeline,
+    integration_params: IntegrationParameters,
+    island_manager: IslandManager,
+    broad_phase: DefaultBroadPhase,
+    narrow_phase: NarrowPhase,
+    bodies: RigidBodySet,
+    colliders: ColliderSet,
+    impulse_joints: ImpulseJointSet,
+    multibody_joints: MultibodyJointSet,
+    ccd_solver: CCDSolver,
+    gravity: Vec3,
+
+    // Ball tracking (sorted by entity_id for deterministic iteration).
+    ball_infos: Vec<BallInfo>,
+    drum_body_handle: RigidBodyHandle,
+
+    // Simulation state.
     event_stream: EventStream,
     checkpoints: Vec<CpsfCheckpoint>,
     exits: Vec<BallExit>,
     completed: bool,
-    /// BTreeMap for deterministic iteration order (no HashMap per v1 §1.4).
+
+    // Deadlock recovery (per v3 §5, v4 §F).
     ball_nudge_counts: BTreeMap<u32, u32>,
     global_nudge_count: u32,
     rng_recovery: Pcg64,
+    /// Recent mean-square-speed samples for stall detection.
+    recent_mss: Vec<f32>,
 }
 
 impl Simulation {
-    /// Initialize simulation per spec: deterministic RNG seeding.
+    /// Initialize simulation per spec: deterministic RNG seeding + Rapier physics.
     pub fn new(params: SimulationParameters, seed: u64) -> Self {
         // Domain-separated PRNG streams per v2 §4.3.
         let pos_seed = domain_seed(seed, "positions");
@@ -59,28 +81,147 @@ impl Simulation {
         let mut vel_rng = Pcg64::seed_from_u64(vel_seed);
         let rng_recovery = Pcg64::seed_from_u64(recovery_seed);
 
-        // Create balls with deterministic initial state.
-        // Entity IDs: balls are 1..N, drum would be N+1, paddles N+2..
-        let mut balls = Vec::with_capacity(params.ball_count as usize);
+        // Initialize Rapier physics.
+        let mut integration_params = IntegrationParameters::default();
+        integration_params.dt = params.fixed_dt;
+
+        let pipeline = PhysicsPipeline::new();
+        let island_manager = IslandManager::new();
+        let broad_phase = DefaultBroadPhase::new();
+        let narrow_phase = NarrowPhase::new();
+        let mut bodies = RigidBodySet::new();
+        let mut colliders = ColliderSet::new();
+        let impulse_joints = ImpulseJointSet::new();
+        let multibody_joints = MultibodyJointSet::new();
+        let ccd_solver = CCDSolver::new();
+        let gravity = Vec3::new(0.0, -params.gravity, 0.0);
+
+        // --- Build drum geometry ---
+        // The drum is a kinematic body that rotates around Y axis.
+        let drum_rb = RigidBodyBuilder::kinematic_velocity_based()
+            .translation(Vec3::ZERO)
+            // Slow rotation around Y axis for tumbling.
+            .angvel(Vec3::new(0.0, 2.0, 0.0))
+            .build();
+        let drum_body_handle = bodies.insert(drum_rb);
+
+        // Drum walls: approximate cylinder with 12 wall segments.
+        let r = params.drum_radius;
+        let half_h = params.drum_height / 2.0;
+        let n_segments = 12;
+        let wall_thickness = 0.02;
+        for i in 0..n_segments {
+            let angle = std::f32::consts::TAU * (i as f32) / (n_segments as f32);
+            let cos_a = angle.cos();
+            let sin_a = angle.sin();
+            let seg_width = 2.0 * r * (std::f32::consts::PI / n_segments as f32).sin();
+
+            let wall = ColliderBuilder::cuboid(seg_width / 2.0, half_h, wall_thickness / 2.0)
+                .translation(Vec3::new(cos_a * r, 0.0, sin_a * r))
+                .rotation(Vec3::new(0.0, -angle, 0.0))
+                .restitution(params.restitution)
+                .friction(params.friction)
+                .build();
+            colliders.insert_with_parent(wall, drum_body_handle, &mut bodies);
+        }
+
+        // Drum floor — with a chute opening (hole) at one edge.
+        // We model the floor as two half-moon pieces with a gap for the chute.
+        let floor_thickness = 0.02;
+        // Left half of floor.
+        let floor_left = ColliderBuilder::cuboid(r * 0.4, floor_thickness, r * 0.9)
+            .translation(Vec3::new(-r * 0.5, -half_h, 0.0))
+            .restitution(params.restitution)
+            .friction(params.friction)
+            .build();
+        colliders.insert_with_parent(floor_left, drum_body_handle, &mut bodies);
+        // Right half of floor.
+        let floor_right = ColliderBuilder::cuboid(r * 0.4, floor_thickness, r * 0.9)
+            .translation(Vec3::new(r * 0.5, -half_h, 0.0))
+            .restitution(params.restitution)
+            .friction(params.friction)
+            .build();
+        colliders.insert_with_parent(floor_right, drum_body_handle, &mut bodies);
+        // Back portion of floor.
+        let floor_back = ColliderBuilder::cuboid(r * 0.15, floor_thickness, r * 0.5)
+            .translation(Vec3::new(0.0, -half_h, -r * 0.4))
+            .restitution(params.restitution)
+            .friction(params.friction)
+            .build();
+        colliders.insert_with_parent(floor_back, drum_body_handle, &mut bodies);
+
+        // Drum ceiling.
+        let ceiling = ColliderBuilder::cuboid(r, floor_thickness, r)
+            .translation(Vec3::new(0.0, half_h, 0.0))
+            .restitution(params.restitution)
+            .friction(params.friction)
+            .build();
+        colliders.insert_with_parent(ceiling, drum_body_handle, &mut bodies);
+
+        // --- Chute / funnel geometry (static) ---
+        // The chute is a static body below the drum opening.
+        // Funnel: two angled ramps guiding balls downward.
+        let chute_left = ColliderBuilder::cuboid(0.01, 0.15, r * 0.3)
+            .translation(Vec3::new(-0.08, -half_h - 0.12, r * 0.3))
+            .rotation(Vec3::new(0.0, 0.0, 0.3)) // angled inward
+            .restitution(0.3)
+            .friction(0.2)
+            .build();
+        colliders.insert(chute_left);
+
+        let chute_right = ColliderBuilder::cuboid(0.01, 0.15, r * 0.3)
+            .translation(Vec3::new(0.08, -half_h - 0.12, r * 0.3))
+            .rotation(Vec3::new(0.0, 0.0, -0.3)) // angled inward
+            .restitution(0.3)
+            .friction(0.2)
+            .build();
+        colliders.insert(chute_right);
+
+        // Chute back wall (prevents balls from falling backward).
+        let chute_back = ColliderBuilder::cuboid(0.12, 0.15, 0.01)
+            .translation(Vec3::new(0.0, -half_h - 0.12, 0.01))
+            .restitution(0.3)
+            .friction(0.2)
+            .build();
+        colliders.insert(chute_back);
+
+        // --- Create balls ---
+        let mut ball_infos = Vec::with_capacity(params.ball_count as usize);
         for i in 0..params.ball_count {
             let entity_id = i + 1;
-            // Random positions inside drum volume.
-            let x = (pos_rng.gen::<f32>() - 0.5) * params.drum_radius;
-            let y = (pos_rng.gen::<f32>() - 0.5) * params.drum_height;
-            let z = (pos_rng.gen::<f32>() - 0.5) * params.drum_radius;
+
+            // Random positions inside drum volume (within 70% of radius to avoid spawning in walls).
+            let spawn_r = r * 0.7;
+            let x = (pos_rng.gen::<f32>() - 0.5) * spawn_r;
+            let y = (pos_rng.gen::<f32>() - 0.5) * params.drum_height * 0.6;
+            let z = (pos_rng.gen::<f32>() - 0.5) * spawn_r;
 
             // Small random initial velocities.
             let vx = (vel_rng.gen::<f32>() - 0.5) * 0.5;
             let vy = (vel_rng.gen::<f32>() - 0.5) * 0.5;
             let vz = (vel_rng.gen::<f32>() - 0.5) * 0.5;
 
-            balls.push(Ball {
+            let ball_rb = RigidBodyBuilder::dynamic()
+                .translation(Vec3::new(x, y, z))
+                .linvel(Vec3::new(vx, vy, vz))
+                .ccd_enabled(true)
+                .build();
+            let ball_handle = bodies.insert(ball_rb);
+
+            let ball_collider = ColliderBuilder::ball(params.ball_radius)
+                .restitution(params.restitution)
+                .friction(params.friction)
+                .density(params.ball_mass / (4.0 / 3.0 * std::f32::consts::PI * params.ball_radius.powi(3)))
+                .build();
+            colliders.insert_with_parent(ball_collider, ball_handle, &mut bodies);
+
+            ball_infos.push(BallInfo {
                 entity_id,
-                position: [x, y, z],
-                velocity: [vx, vy, vz],
+                body_handle: ball_handle,
                 active: true,
                 exit_frame: None,
                 frozen_position: None,
+                frozen_orientation: None,
             });
         }
 
@@ -88,7 +229,19 @@ impl Simulation {
             params,
             seed,
             frame: 0,
-            balls,
+            pipeline,
+            integration_params,
+            island_manager,
+            broad_phase,
+            narrow_phase,
+            bodies,
+            colliders,
+            impulse_joints,
+            multibody_joints,
+            ccd_solver,
+            gravity,
+            ball_infos,
+            drum_body_handle,
             event_stream: EventStream::new(),
             checkpoints: Vec::new(),
             exits: Vec::new(),
@@ -96,6 +249,7 @@ impl Simulation {
             ball_nudge_counts: BTreeMap::new(),
             global_nudge_count: 0,
             rng_recovery,
+            recent_mss: Vec::new(),
         };
 
         // Record SimStart event.
@@ -131,97 +285,59 @@ impl Simulation {
 
     fn step_one(&mut self) {
         self.frame += 1;
-        let dt = self.params.fixed_dt;
 
-        // Placeholder physics: gravity + boundary bounce.
-        // Stable iteration: iterate by entity_id order (balls are pre-sorted).
-        for ball in self.balls.iter_mut() {
-            if !ball.active {
-                continue;
-            }
+        // Step Rapier physics pipeline (deterministic with enhanced-determinism).
+        self.pipeline.step(
+            self.gravity,
+            &self.integration_params,
+            &mut self.island_manager,
+            &mut self.broad_phase,
+            &mut self.narrow_phase,
+            &mut self.bodies,
+            &mut self.colliders,
+            &mut self.impulse_joints,
+            &mut self.multibody_joints,
+            &mut self.ccd_solver,
+            &(),
+            &(),
+        );
 
-            // Apply gravity.
-            ball.velocity[1] -= self.params.gravity * dt;
-
-            // Integrate position.
-            for i in 0..3 {
-                ball.position[i] += ball.velocity[i] * dt;
-            }
-
-            // Boundary bounce (drum walls — simplified cylinder).
-            let r = self.params.drum_radius - self.params.ball_radius;
-            let dist_xz = (ball.position[0] * ball.position[0]
-                + ball.position[2] * ball.position[2])
-                .sqrt();
-            if dist_xz > r {
-                // Reflect radially.
-                let nx = ball.position[0] / dist_xz;
-                let nz = ball.position[2] / dist_xz;
-                let dot = ball.velocity[0] * nx + ball.velocity[2] * nz;
-                if dot > 0.0 {
-                    ball.velocity[0] -= 2.0 * dot * nx * self.params.restitution;
-                    ball.velocity[2] -= 2.0 * dot * nz * self.params.restitution;
-                }
-                // Push back inside.
-                ball.position[0] = nx * r;
-                ball.position[2] = nz * r;
-            }
-
-            // Floor/ceiling bounce.
-            let half_h = self.params.drum_height / 2.0 - self.params.ball_radius;
-            if ball.position[1] < -half_h {
-                ball.position[1] = -half_h;
-                if ball.velocity[1] < 0.0 {
-                    ball.velocity[1] = -ball.velocity[1] * self.params.restitution;
-                }
-            }
-            if ball.position[1] > half_h {
-                ball.position[1] = half_h;
-                if ball.velocity[1] > 0.0 {
-                    ball.velocity[1] = -ball.velocity[1] * self.params.restitution;
-                }
-            }
-        }
-
-        // Exit detection (post-step per v3 §2.3 / v4 §C).
+        // --- Exit detection (post-step per v3 §2.3 / v4 §C) ---
         let mut new_exits = Vec::new();
-        for ball in self.balls.iter() {
-            if !ball.active {
+        for info in &self.ball_infos {
+            if !info.active {
                 continue;
             }
-            // Check exit conditions per v4 §C.2.
+            let body = &self.bodies[info.body_handle];
+            let pos = body.translation();
+            let vel = body.linvel();
+
             let normal = self.params.chute_exit_normal;
             let origin = self.params.chute_exit_origin;
             let rel = [
-                ball.position[0] - origin[0],
-                ball.position[1] - origin[1],
-                ball.position[2] - origin[2],
+                pos.x - origin[0],
+                pos.y - origin[1],
+                pos.z - origin[2],
             ];
             let pos_dot = rel[0] * normal[0] + rel[1] * normal[1] + rel[2] * normal[2];
-            let vel_dot = ball.velocity[0] * normal[0]
-                + ball.velocity[1] * normal[1]
-                + ball.velocity[2] * normal[2];
+            let vel_dot = vel.x * normal[0] + vel.y * normal[1] + vel.z * normal[2];
 
             if pos_dot > self.params.exit_position_threshold
                 && vel_dot > self.params.exit_velocity_threshold
             {
-                // Quantized distance for tie-breaking per v4 §D.2.
                 let quantized = (pos_dot / self.params.exit_distance_quantum) as i32;
-                new_exits.push((ball.entity_id, quantized, ball.position));
+                new_exits.push((info.entity_id, quantized, [pos.x, pos.y, pos.z]));
             }
         }
 
         // Sort same-frame exits: quantized_distance DESC, entity_id ASC (v4 §D.2).
-        new_exits.sort_by(|a, b| {
-            b.1.cmp(&a.1).then(a.0.cmp(&b.0))
-        });
+        new_exits.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
 
         // Process exits.
         for (entity_id, _, last_pos) in &new_exits {
             if self.exits.len() >= self.params.required_exits as usize {
                 break;
             }
-            // Record exit.
             self.exits.push(BallExit {
                 entity_id: *entity_id,
                 exit_frame: self.frame,
@@ -233,13 +349,23 @@ impl Simulation {
                 sequence_no: self.exits.len() as u16,
                 payload: entity_id.to_le_bytes().to_vec(),
             });
-            // Mark ball inactive, freeze position (v4 §C.3).
-            if let Some(ball) = self.balls.iter_mut().find(|b| b.entity_id == *entity_id) {
-                ball.active = false;
-                ball.frozen_position = Some(*last_pos);
-                ball.exit_frame = Some(self.frame);
-                // Zero velocities for CPSF (v4 §C.3).
-                ball.velocity = [0.0, 0.0, 0.0];
+
+            // Freeze ball (v4 §C.3): set kinematic, zero velocity, freeze position.
+            if let Some(info) = self.ball_infos.iter_mut().find(|b| b.entity_id == *entity_id) {
+                info.active = false;
+                info.frozen_position = Some(*last_pos);
+                info.exit_frame = Some(self.frame);
+
+                // Read orientation before freezing.
+                let body = &self.bodies[info.body_handle];
+                let rot = body.rotation();
+                info.frozen_orientation = Some([rot.x, rot.y, rot.z, rot.w]);
+
+                // Disable the body by setting it to kinematic with zero velocity.
+                let body = &mut self.bodies[info.body_handle];
+                body.set_body_type(RigidBodyType::KinematicVelocityBased, true);
+                body.set_linvel(Vec3::ZERO, true);
+                body.set_angvel(Vec3::ZERO, true);
             }
 
             // Checkpoint on exit per v4 §B.2.
@@ -260,13 +386,17 @@ impl Simulation {
                 sequence_no: 0,
                 payload: Vec::new(),
             });
-            // Final checkpoint.
             let cpsf = self.compute_cpsf();
             self.checkpoints.push(CpsfCheckpoint {
                 frame: self.frame,
                 hash: cpsf.hash(),
             });
             return;
+        }
+
+        // --- Deadlock recovery (v3 §5, v4 §F) ---
+        if self.frame % self.params.deadlock.check_interval_frames == 0 {
+            self.check_deadlock();
         }
 
         // Check timeout.
@@ -304,36 +434,186 @@ impl Simulation {
         }
     }
 
-    /// Apply external events (user input). Phase-1: stub, events are recorded.
+    /// Deadlock detection and recovery per v3 §5, v4 §F.
+    fn check_deadlock(&mut self) {
+        // Compute mean-square-speed (MSS) of active balls.
+        let mut sum_v2: f32 = 0.0;
+        let mut count: u32 = 0;
+        for info in &self.ball_infos {
+            if !info.active {
+                continue;
+            }
+            let body = &self.bodies[info.body_handle];
+            let v = body.linvel();
+            sum_v2 += v.x * v.x + v.y * v.y + v.z * v.z;
+            count += 1;
+        }
+        if count == 0 {
+            return;
+        }
+        let mss = sum_v2 / count as f32;
+        self.recent_mss.push(mss);
+
+        // Check if stalled: MSS below threshold for sufficient samples.
+        let window_checks = (self.params.deadlock.drum_stall_window_frames
+            / self.params.deadlock.check_interval_frames) as usize;
+        if self.recent_mss.len() < window_checks {
+            return;
+        }
+
+        // Keep only the recent window.
+        while self.recent_mss.len() > window_checks {
+            self.recent_mss.remove(0);
+        }
+
+        let all_stalled = self.recent_mss.iter().all(|&m| m < self.params.deadlock.drum_stall_mss_threshold);
+        if !all_stalled {
+            return;
+        }
+
+        // Stall detected — apply nudge to a random active ball.
+        if self.global_nudge_count >= self.params.deadlock.max_global_nudges {
+            return; // Hit global limit.
+        }
+
+        // Find an eligible ball (hasn't exceeded per-ball limit).
+        let eligible: Vec<u32> = self.ball_infos.iter()
+            .filter(|b| b.active)
+            .filter(|b| {
+                let count = self.ball_nudge_counts.get(&b.entity_id).copied().unwrap_or(0);
+                count < self.params.deadlock.max_nudges_per_ball
+            })
+            .map(|b| b.entity_id)
+            .collect();
+
+        if eligible.is_empty() {
+            return;
+        }
+
+        // Pick a ball deterministically using rng_recovery.
+        let idx = self.rng_recovery.gen_range(0..eligible.len());
+        let target_id = eligible[idx];
+
+        // Generate deterministic nudge direction.
+        let nx: f32 = self.rng_recovery.gen::<f32>() - 0.5;
+        let ny: f32 = self.rng_recovery.gen::<f32>().abs() + 0.5; // bias upward
+        let nz: f32 = self.rng_recovery.gen::<f32>() - 0.5;
+        let len = (nx * nx + ny * ny + nz * nz).sqrt();
+        let force_mag = self.params.deadlock.nudge_force_magnitude;
+        let impulse = Vec3::new(
+            nx / len * force_mag * self.params.fixed_dt,
+            ny / len * force_mag * self.params.fixed_dt,
+            nz / len * force_mag * self.params.fixed_dt,
+        );
+
+        // Apply impulse to the target ball.
+        if let Some(info) = self.ball_infos.iter().find(|b| b.entity_id == target_id) {
+            let body = &mut self.bodies[info.body_handle];
+            body.apply_impulse(impulse, true);
+        }
+
+        // Record nudge counts.
+        *self.ball_nudge_counts.entry(target_id).or_insert(0) += 1;
+        self.global_nudge_count += 1;
+
+        // Clear MSS history after nudge to re-evaluate.
+        self.recent_mss.clear();
+    }
+
+    /// Apply external events (user input forces).
+    /// Parses UserInputPayload from events and applies forces to nearest ball.
     pub fn apply_events(&mut self, events: &[InputEvent]) {
         for event in events {
             self.event_stream.push(event.clone());
+
+            // Apply force for touch events.
+            match event.event_type {
+                EventType::UserTouchStart | EventType::UserTouchMove => {
+                    if event.payload.len() >= 28 {
+                        // Parse UserInputPayload from bytes.
+                        let payload = parse_input_payload(&event.payload);
+                        if let Some(p) = payload {
+                            self.apply_user_force(p.drum_x, p.drum_y, p.force_magnitude, p.direction_x, p.direction_y);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Apply a user interaction force at drum coordinates.
+    fn apply_user_force(&mut self, drum_x: f32, drum_y: f32, force_mag: f32, dir_x: f32, dir_y: f32) {
+        // Find the nearest active ball to the touch point in drum space.
+        let touch_pos = Vec3::new(drum_x, drum_y, 0.0);
+        let mut best_dist = f32::MAX;
+        let mut best_handle: Option<RigidBodyHandle> = None;
+
+        for info in &self.ball_infos {
+            if !info.active {
+                continue;
+            }
+            let body = &self.bodies[info.body_handle];
+            let pos = body.translation();
+            let dx = pos.x - touch_pos.x;
+            let dy = pos.y - touch_pos.y;
+            let dist = dx * dx + dy * dy;
+            if dist < best_dist {
+                best_dist = dist;
+                best_handle = Some(info.body_handle);
+            }
+        }
+
+        // Apply force if within reasonable range (2x ball radius).
+        let max_dist = (self.params.ball_radius * 4.0).powi(2);
+        if let Some(handle) = best_handle {
+            if best_dist < max_dist {
+                let impulse = Vec3::new(
+                    dir_x * force_mag * self.params.fixed_dt,
+                    dir_y * force_mag * self.params.fixed_dt,
+                    0.0,
+                );
+                let body = &mut self.bodies[handle];
+                body.apply_impulse(impulse, true);
+            }
         }
     }
 
     /// Compute CPSF at current frame.
     pub fn compute_cpsf(&self) -> Cpsf {
-        let mut bodies = Vec::with_capacity(self.balls.len());
-        for ball in &self.balls {
-            let pos = if let Some(frozen) = ball.frozen_position {
-                frozen
+        let mut bodies_state = Vec::with_capacity(self.ball_infos.len());
+        for info in &self.ball_infos {
+            let (pos, rot, linvel, angvel, sleeping) = if let Some(frozen_pos) = info.frozen_position {
+                let frozen_rot = info.frozen_orientation.unwrap_or([0.0, 0.0, 0.0, 1.0]);
+                (frozen_pos, frozen_rot, [0.0f32, 0.0, 0.0], [0.0f32, 0.0, 0.0], false)
             } else {
-                ball.position
+                let body = &self.bodies[info.body_handle];
+                let t = body.translation();
+                let r = body.rotation();
+                let lv = body.linvel();
+                let av = body.angvel();
+                (
+                    [t.x, t.y, t.z],
+                    [r.x, r.y, r.z, r.w],
+                    [lv.x, lv.y, lv.z],
+                    [av.x, av.y, av.z],
+                    body.is_sleeping(),
+                )
             };
-            bodies.push(BodyState {
-                entity_id: ball.entity_id,
+
+            bodies_state.push(BodyState {
+                entity_id: info.entity_id,
                 position: pos,
-                orientation: [0.0, 0.0, 0.0, 1.0], // identity quaternion
-                linear_velocity: ball.velocity,
-                angular_velocity: [0.0, 0.0, 0.0],
-                is_sleeping: false,
-                is_active: ball.active,
+                orientation: rot,
+                linear_velocity: linvel,
+                angular_velocity: angvel,
+                is_sleeping: sleeping,
+                is_active: info.active,
             });
         }
-        // Bodies sorted by entity_id ascending (already in order by construction).
         Cpsf {
             frame_number: self.frame,
-            bodies,
+            bodies: bodies_state,
         }
     }
 
@@ -353,7 +633,7 @@ impl Simulation {
         } else if self.frame >= self.params.max_draw_duration_frames {
             DrawStatus::DrawTimedOut
         } else {
-            DrawStatus::DrawComplete // in progress, but report what we have
+            DrawStatus::DrawComplete // in progress
         };
         DrawOutcome {
             status,
@@ -391,4 +671,54 @@ impl Simulation {
     pub fn checkpoints(&self) -> &[CpsfCheckpoint] {
         &self.checkpoints
     }
+
+    pub fn exits(&self) -> &[BallExit] {
+        &self.exits
+    }
+
+    /// Get ball render data as flat f32 array: [x, y, z, active, x, y, z, active, ...]
+    /// 4 floats per ball. active = 1.0 if still in play, 0.0 if exited.
+    pub fn get_ball_positions_flat(&self) -> Vec<f32> {
+        let mut out = Vec::with_capacity(self.ball_infos.len() * 4);
+        for info in &self.ball_infos {
+            if let Some(fp) = info.frozen_position {
+                out.push(fp[0]);
+                out.push(fp[1]);
+                out.push(fp[2]);
+                out.push(0.0);
+            } else {
+                let body = &self.bodies[info.body_handle];
+                let t = body.translation();
+                out.push(t.x);
+                out.push(t.y);
+                out.push(t.z);
+                out.push(if info.active { 1.0 } else { 0.0 });
+            }
+        }
+        out
+    }
+
+    /// Get drum rotation angle (radians around Y) for rendering.
+    pub fn get_drum_angle(&self) -> f32 {
+        let body = &self.bodies[self.drum_body_handle];
+        let rot = body.rotation();
+        // Extract Y rotation from quaternion (simplified for Y-only rotation).
+        2.0 * rot.y.atan2(rot.w)
+    }
+}
+
+/// Parse UserInputPayload from raw bytes.
+fn parse_input_payload(data: &[u8]) -> Option<UserInputPayload> {
+    if data.len() < 28 {
+        return None;
+    }
+    Some(UserInputPayload {
+        screen_x: i32::from_le_bytes(data[0..4].try_into().ok()?),
+        screen_y: i32::from_le_bytes(data[4..8].try_into().ok()?),
+        drum_x: f32::from_bits(u32::from_le_bytes(data[8..12].try_into().ok()?)),
+        drum_y: f32::from_bits(u32::from_le_bytes(data[12..16].try_into().ok()?)),
+        force_magnitude: f32::from_bits(u32::from_le_bytes(data[16..20].try_into().ok()?)),
+        direction_x: f32::from_bits(u32::from_le_bytes(data[20..24].try_into().ok()?)),
+        direction_y: f32::from_bits(u32::from_le_bytes(data[24..28].try_into().ok()?)),
+    })
 }

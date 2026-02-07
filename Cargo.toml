@@ -14,3 +14,6 @@ rand_pcg = "0.3"
 rand = "0.8"
 bincode = "1"
 uuid = { version = "1", features = ["v4"] }
+rapier3d = { version = "0.32", features = ["enhanced-determinism", "serde-serialize"] }
+nalgebra = "0.34"
+glam = "0.30"

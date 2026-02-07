@@ -2,126 +2,329 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Lottery Sim — Phase-1 Web Harness</title>
+    <title>Lottery Sim — Phase-3 Web Harness</title>
     <style>
-        body { font-family: monospace; max-width: 800px; margin: 40px auto; background: #1a1a2e; color: #e0e0e0; }
-        h1 { color: #00d4ff; }
-        button { padding: 8px 16px; margin: 4px; cursor: pointer; background: #16213e; color: #e0e0e0; border: 1px solid #00d4ff; }
-        button:hover { background: #0f3460; }
-        pre { background: #0d1117; padding: 12px; border: 1px solid #333; overflow-x: auto; max-height: 400px; overflow-y: auto; }
-        #status { color: #00ff88; }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: monospace; background: #0d1117; color: #e0e0e0; display: flex; flex-direction: column; height: 100vh; }
+        #header { padding: 8px 16px; background: #161b22; border-bottom: 1px solid #30363d; display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
+        #header h1 { font-size: 14px; color: #58a6ff; white-space: nowrap; }
+        .info { font-size: 12px; color: #8b949e; }
+        .info span { color: #e0e0e0; }
+        #controls { display: flex; gap: 8px; }
+        button { padding: 4px 12px; font-family: monospace; font-size: 12px; cursor: pointer; background: #21262d; color: #e0e0e0; border: 1px solid #30363d; border-radius: 4px; }
+        button:hover { background: #30363d; }
+        button:disabled { opacity: 0.4; cursor: default; }
+        button.primary { background: #238636; border-color: #2ea043; }
+        button.primary:hover { background: #2ea043; }
+        #canvas-container { flex: 1; position: relative; overflow: hidden; }
+        canvas { display: block; width: 100%; height: 100%; }
+        #hud { position: absolute; top: 8px; left: 8px; font-size: 12px; background: rgba(13,17,23,0.85); padding: 8px; border-radius: 4px; border: 1px solid #30363d; pointer-events: none; }
+        #hud div { margin: 2px 0; }
+        #hud .label { color: #8b949e; }
+        #hud .value { color: #58a6ff; }
+        #log { height: 120px; overflow-y: auto; padding: 8px 16px; background: #0d1117; border-top: 1px solid #30363d; font-size: 11px; color: #8b949e; }
     </style>
 </head>
 <body>
-    <h1>Lottery Sim — Phase-1 Harness</h1>
-    <p>Minimal WASM loader. No 3D rendering — foundation only.</p>
-    <div>
-        <button id="btn-run">Run Simulation</button>
-        <button id="btn-export" disabled>Export Replay</button>
+    <div id="header">
+        <h1>Lottery Sim</h1>
+        <div class="info">Frame: <span id="frame-num">0</span></div>
+        <div class="info">Exits: <span id="exit-count">0</span>/<span id="exit-total">6</span></div>
+        <div class="info">Status: <span id="status">Ready</span></div>
+        <div id="controls">
+            <button id="btn-run" class="primary">Run Simulation</button>
+            <button id="btn-pause" disabled>Pause</button>
+            <button id="btn-export" disabled>Export Replay</button>
+        </div>
     </div>
-    <p id="status">Ready.</p>
-    <pre id="output"></pre>
+    <div id="canvas-container">
+        <canvas id="render-canvas"></canvas>
+        <div id="hud">
+            <div><span class="label">Seed:</span> <span class="value" id="hud-seed">42</span></div>
+            <div><span class="label">WASM Hash:</span> <span class="value" id="hud-hash">loading...</span></div>
+        </div>
+    </div>
+    <div id="log"></div>
+
+    <script type="importmap">
+    {
+        "imports": {
+            "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+            "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+        }
+    }
+    </script>
 
     <script type="module">
-        import init, { WasmSimulation } from './pkg/lottery_sim_wasm.js';
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import init, { WasmSimulation, compute_wasm_hash } from './pkg/lottery_sim_wasm.js';
 
-        const status = document.getElementById('status');
-        const output = document.getElementById('output');
+        // --- DOM ---
+        const frameNum = document.getElementById('frame-num');
+        const exitCount = document.getElementById('exit-count');
+        const exitTotal = document.getElementById('exit-total');
+        const statusEl = document.getElementById('status');
+        const hudHash = document.getElementById('hud-hash');
+        const logEl = document.getElementById('log');
         const btnRun = document.getElementById('btn-run');
+        const btnPause = document.getElementById('btn-pause');
         const btnExport = document.getElementById('btn-export');
-
-        let sim = null;
-        // Placeholder WASM hash (will be replaced with actual hash in production).
-        const WASM_HASH = '0'.repeat(64);
+        const canvas = document.getElementById('render-canvas');
 
         function log(msg) {
-            output.textContent += msg + '\n';
-            output.scrollTop = output.scrollHeight;
+            const d = document.createElement('div');
+            d.textContent = `[${new Date().toISOString().slice(11,19)}] ${msg}`;
+            logEl.appendChild(d);
+            logEl.scrollTop = logEl.scrollHeight;
         }
 
+        // --- Sim Params ---
+        const SEED = BigInt(42);
+        const PARAMS = {
+            ball_count: 50, required_exits: 6,
+            ball_radius: 0.02, ball_mass: 0.010,
+            drum_radius: 0.5, drum_height: 0.4,
+            gravity: 9.81, restitution: 0.6, friction: 0.3,
+            fixed_dt: 1.0/120.0, max_draw_duration_frames: 36000,
+            chute_exit_normal: [0.0, -1.0, 0.0],
+            chute_exit_origin: [0.0, -0.5, 0.0],
+            exit_velocity_threshold: 0.01,
+            exit_position_threshold: 0.005,
+            exit_distance_quantum: 0.001,
+            deadlock: {
+                drum_stall_mss_threshold: 0.200,
+                drum_stall_window_frames: 240,
+                chute_jam_window_frames: 360,
+                chute_progress_epsilon: 0.01,
+                nudge_force_magnitude: 5.0,
+                max_nudges_per_ball: 3,
+                max_global_nudges: 20,
+                check_interval_frames: 120,
+            },
+            cpsf_checkpoint_interval_frames: 120,
+        };
+
+        // --- Three.js Setup ---
+        const container = document.getElementById('canvas-container');
+        const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+        renderer.setPixelRatio(window.devicePixelRatio);
+        renderer.setClearColor(0x0d1117);
+
+        const scene = new THREE.Scene();
+        const camera = new THREE.PerspectiveCamera(60, 1, 0.01, 100);
+        camera.position.set(0, 0.3, 1.5);
+        camera.lookAt(0, 0, 0);
+
+        const controls = new OrbitControls(camera, canvas);
+        controls.enableDamping = true;
+        controls.target.set(0, 0, 0);
+
+        // Lighting
+        scene.add(new THREE.AmbientLight(0x404050, 2.0));
+        const dirLight = new THREE.DirectionalLight(0xffffff, 1.5);
+        dirLight.position.set(2, 3, 2);
+        scene.add(dirLight);
+
+        // Grid for reference
+        const grid = new THREE.GridHelper(2, 20, 0x222244, 0x111122);
+        grid.position.y = -0.5;
+        scene.add(grid);
+
+        // --- Drum Geometry (visual) ---
+        const drumGroup = new THREE.Group();
+        scene.add(drumGroup);
+
+        const drumR = PARAMS.drum_radius;
+        const drumH = PARAMS.drum_height;
+
+        // Drum walls (wireframe cylinder)
+        const cylGeom = new THREE.CylinderGeometry(drumR, drumR, drumH, 24, 1, true);
+        const cylMat = new THREE.MeshPhongMaterial({
+            color: 0x334455, transparent: true, opacity: 0.25,
+            side: THREE.DoubleSide, wireframe: false,
+        });
+        const drumCyl = new THREE.Mesh(cylGeom, cylMat);
+        drumGroup.add(drumCyl);
+
+        // Drum wireframe
+        const wireGeom = new THREE.CylinderGeometry(drumR, drumR, drumH, 12, 1, true);
+        const wireMat = new THREE.MeshBasicMaterial({ color: 0x58a6ff, wireframe: true, transparent: true, opacity: 0.4 });
+        drumGroup.add(new THREE.Mesh(wireGeom, wireMat));
+
+        // Drum floor (with hole) - just show full circle for clarity
+        const floorGeom = new THREE.CircleGeometry(drumR, 24);
+        const floorMat = new THREE.MeshPhongMaterial({ color: 0x223344, transparent: true, opacity: 0.4, side: THREE.DoubleSide });
+        const floor = new THREE.Mesh(floorGeom, floorMat);
+        floor.rotation.x = -Math.PI / 2;
+        floor.position.y = -drumH / 2;
+        drumGroup.add(floor);
+
+        // Ceiling
+        const ceiling = floor.clone();
+        ceiling.position.y = drumH / 2;
+        drumGroup.add(ceiling);
+
+        // --- Chute (visual) ---
+        const chuteGeom = new THREE.BoxGeometry(0.12, 0.3, 0.15);
+        const chuteMat = new THREE.MeshPhongMaterial({ color: 0x445566, transparent: true, opacity: 0.3, side: THREE.DoubleSide });
+        const chuteMesh = new THREE.Mesh(chuteGeom, chuteMat);
+        chuteMesh.position.set(0, -drumH / 2 - 0.12, drumR * 0.3);
+        scene.add(chuteMesh);
+
+        // --- Ball Instances ---
+        const ballGeom = new THREE.SphereGeometry(PARAMS.ball_radius, 12, 8);
+        const ballMatActive = new THREE.MeshPhongMaterial({ color: 0xff6644 });
+        const ballMatExited = new THREE.MeshPhongMaterial({ color: 0x44ff88, emissive: 0x114422 });
+
+        const ballMeshes = [];
+        for (let i = 0; i < PARAMS.ball_count; i++) {
+            const mesh = new THREE.Mesh(ballGeom, ballMatActive.clone());
+            mesh.visible = false;
+            scene.add(mesh);
+            ballMeshes.push(mesh);
+        }
+
+        // --- Resize ---
+        function resize() {
+            const w = container.clientWidth;
+            const h = container.clientHeight;
+            renderer.setSize(w, h);
+            camera.aspect = w / h;
+            camera.updateProjectionMatrix();
+        }
+        window.addEventListener('resize', resize);
+        resize();
+
+        // --- Simulation State ---
+        let sim = null;
+        let wasmHash = '';
+        let running = false;
+        let paused = false;
+
+        // --- WASM Init ---
+        async function initWasm() {
+            log('Initializing WASM...');
+            await init();
+
+            // Compute WASM binary hash
+            const wasmUrl = new URL('./pkg/lottery_sim_wasm_bg.wasm', window.location.href);
+            const wasmBytes = await fetch(wasmUrl).then(r => r.arrayBuffer());
+            wasmHash = compute_wasm_hash(new Uint8Array(wasmBytes));
+            hudHash.textContent = wasmHash.slice(0, 12) + '...';
+            log(`WASM hash: ${wasmHash}`);
+            statusEl.textContent = 'Initialized';
+        }
+
+        // --- Run Sim ---
         btnRun.addEventListener('click', async () => {
-            try {
-                status.textContent = 'Initializing WASM...';
-                await init();
+            if (!wasmHash) await initWasm();
 
-                status.textContent = 'Creating simulation...';
-                const params = JSON.stringify({
-                    ball_count: 50,
-                    required_exits: 6,
-                    ball_radius: 0.02,
-                    ball_mass: 0.010,
-                    drum_radius: 0.5,
-                    drum_height: 0.4,
-                    gravity: 9.81,
-                    restitution: 0.6,
-                    friction: 0.3,
-                    fixed_dt: 0.008333333,
-                    max_draw_duration_frames: 36000,
-                    chute_exit_normal: [0.0, -1.0, 0.0],
-                    chute_exit_origin: [0.0, -0.5, 0.0],
-                    exit_velocity_threshold: 0.01,
-                    exit_position_threshold: 0.005,
-                    exit_distance_quantum: 0.001,
-                    deadlock: {
-                        drum_stall_mss_threshold: 0.200,
-                        drum_stall_window_frames: 240,
-                        chute_jam_window_frames: 360,
-                        chute_progress_epsilon: 0.01,
-                        nudge_force_magnitude: 5.0,
-                        max_nudges_per_ball: 3,
-                        max_global_nudges: 20,
-                        check_interval_frames: 120,
-                    },
-                    cpsf_checkpoint_interval_frames: 120,
-                });
+            sim = new WasmSimulation(JSON.stringify(PARAMS), SEED, wasmHash);
+            exitTotal.textContent = sim.required_exits();
+            running = true;
+            paused = false;
+            btnRun.disabled = true;
+            btnPause.disabled = false;
+            btnExport.disabled = true;
+            statusEl.textContent = 'Running';
+            log(`Simulation started. Seed: 42, WASM hash: ${wasmHash.slice(0,16)}...`);
 
-                const seed = BigInt(42);
-                sim = new WasmSimulation(params, seed, WASM_HASH);
-                log('Simulation initialized. Seed: 42');
+            // Make balls visible
+            ballMeshes.forEach(m => m.visible = true);
 
-                status.textContent = 'Running simulation...';
-                const startTime = performance.now();
-                let stepCount = 0;
-                while (!sim.is_completed() && stepCount < 36000) {
-                    sim.step(120);  // Step 1 second of sim time at a time.
-                    stepCount += 120;
-                    if (stepCount % 1200 === 0) {
-                        log(`  Frame ${sim.frame()}...`);
-                    }
-                }
-                const elapsed = (performance.now() - startTime).toFixed(1);
-                log(`Simulation complete at frame ${sim.frame()} (${elapsed}ms wall)`);
+            requestAnimationFrame(simLoop);
+        });
 
-                const outcome = sim.get_outcome();
-                log('Outcome: ' + outcome);
-
-                const cp = sim.get_cpsf_checkpoint();
-                log('Final CPSF: ' + cp);
-
-                btnExport.disabled = false;
-                status.textContent = 'Done. Click "Export Replay" to download.';
-            } catch (e) {
-                status.textContent = 'Error: ' + e;
-                log('ERROR: ' + e);
-            }
+        btnPause.addEventListener('click', () => {
+            paused = !paused;
+            btnPause.textContent = paused ? 'Resume' : 'Pause';
+            statusEl.textContent = paused ? 'Paused' : 'Running';
         });
 
         btnExport.addEventListener('click', () => {
             if (!sim) return;
-            try {
-                const replayBytes = sim.export_replay();
-                const blob = new Blob([replayBytes], { type: 'application/octet-stream' });
-                const url = URL.createObjectURL(blob);
-                const a = document.createElement('a');
-                a.href = url;
-                a.download = 'lottery_sim.replay';
-                a.click();
-                URL.revokeObjectURL(url);
-                log('Replay exported.');
-                status.textContent = 'Replay file downloaded.';
-            } catch (e) {
-                log('Export error: ' + e);
+            const replayBytes = sim.export_replay();
+            const blob = new Blob([replayBytes], { type: 'application/octet-stream' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = 'lottery_sim.replay';
+            a.click();
+            URL.revokeObjectURL(url);
+            log(`Replay exported (${replayBytes.length} bytes).`);
+        });
+
+        // --- Simulation Loop ---
+        const TICKS_PER_FRAME = 4; // 4 physics ticks per render frame (~30fps sim at 120Hz physics)
+
+        function simLoop() {
+            if (!running) return;
+
+            if (!paused && sim && !sim.is_completed()) {
+                sim.step(TICKS_PER_FRAME);
+                updateBalls();
+                updateHUD();
             }
+
+            if (sim && sim.is_completed() && running) {
+                running = false;
+                btnExport.disabled = false;
+                btnPause.disabled = true;
+                statusEl.textContent = 'Complete';
+                log(`Simulation complete at frame ${sim.frame()}. Exits: ${sim.exit_count()}`);
+                log(`Outcome: ${sim.get_outcome()}`);
+                log(`Final CPSF: ${sim.get_cpsf_checkpoint()}`);
+            }
+
+            controls.update();
+            renderer.render(scene, camera);
+            requestAnimationFrame(simLoop);
+        }
+
+        function updateBalls() {
+            if (!sim) return;
+            const positions = sim.get_ball_positions();
+            const drumAngle = sim.get_drum_angle();
+
+            // Update drum rotation
+            drumGroup.rotation.y = drumAngle;
+
+            // Update ball positions
+            for (let i = 0; i < PARAMS.ball_count; i++) {
+                const x = positions[i * 4 + 0];
+                const y = positions[i * 4 + 1];
+                const z = positions[i * 4 + 2];
+                const active = positions[i * 4 + 3];
+
+                ballMeshes[i].position.set(x, y, z);
+                if (active < 0.5) {
+                    ballMeshes[i].material.color.setHex(0x44ff88);
+                    ballMeshes[i].material.emissive.setHex(0x114422);
+                }
+            }
+        }
+
+        function updateHUD() {
+            if (!sim) return;
+            frameNum.textContent = sim.frame();
+            exitCount.textContent = sim.exit_count();
+        }
+
+        // --- Start render loop (even before sim starts) ---
+        function renderLoop() {
+            controls.update();
+            renderer.render(scene, camera);
+            requestAnimationFrame(renderLoop);
+        }
+
+        // Init
+        initWasm().then(() => {
+            renderLoop();
+            log('Ready. Click "Run Simulation" to start.');
+        }).catch(e => {
+            log('WASM init error: ' + e);
+            statusEl.textContent = 'Error';
         });
     </script>
 </body>

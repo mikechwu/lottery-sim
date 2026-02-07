@@ -1,4 +1,5 @@
 use serde::{Serialize, Deserialize};
+use crate::event::EventType;
 use crate::replay::{ReplayContainer, ReplayError};
 use crate::sim::Simulation;
 use crate::params::SimulationParameters;
@@ -162,7 +163,7 @@ impl Verifier {
             }
         }
 
-        // Run simulation frame by frame, checking checkpoints.
+        // Run simulation frame by frame, replaying user events and checking checkpoints.
         if first_mismatch.is_none() {
             // Build a lookup: frame -> expected hash.
             let mut checkpoint_map: std::collections::BTreeMap<u32, Vec<[u8; 32]>> =
@@ -174,6 +175,21 @@ impl Verifier {
                     .push(cp.hash);
             }
 
+            // Build a lookup: frame -> user input events to replay.
+            let mut input_event_map: std::collections::BTreeMap<u32, Vec<crate::event::InputEvent>> =
+                std::collections::BTreeMap::new();
+            for ev in &container.event_stream.events {
+                match ev.event_type {
+                    EventType::UserTouchStart | EventType::UserTouchMove | EventType::UserTouchEnd => {
+                        input_event_map
+                            .entry(ev.frame)
+                            .or_default()
+                            .push(ev.clone());
+                    }
+                    _ => {}
+                }
+            }
+
             let max_frame = replay_checkpoints
                 .last()
                 .map(|cp| cp.frame)
@@ -183,6 +199,14 @@ impl Verifier {
                 if sim.is_completed() {
                     break;
                 }
+
+                // Replay user input events at the recorded frame before stepping.
+                // Events are applied when sim.frame() matches the event's frame.
+                let current = sim.frame();
+                if let Some(events) = input_event_map.remove(&current) {
+                    sim.apply_events(&events);
+                }
+
                 sim.step(1);
 
                 let current_frame = sim.frame();
