@@ -1,0 +1,54 @@
+# --- macOS Specific ---
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+.TemporaryItems
+.cache
+
+# --- Security (NEVER COMMIT THESE) ---
+configs/secrets.json
+.env
+*.pem
+*.key
+
+# --- Rust / Cargo ---
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# --- WASM Build Artifacts ---
+web-harness/pkg/
+*.wasm
+*.d.ts
+
+# --- Testing & Benchmarking ---
+.pytest_cache/
+.benchmarks/
+*.replay
+
+# --- Reports & Prompts (project-internal, not versioned) ---
+.reports/
+.claudeprompt/
+runs/
+
+# --- Data (Too large for Git) ---
+data/
+!data/.gitkeep
+
+# --- IDE Settings ---
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# --- Environment ---
+env/
+venv/
+node_modules/
+
+# --- Claude Code ---
+.claude/

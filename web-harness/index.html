@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Lottery Sim — Phase-1 Web Harness</title>
+    <style>
+        body { font-family: monospace; max-width: 800px; margin: 40px auto; background: #1a1a2e; color: #e0e0e0; }
+        h1 { color: #00d4ff; }
+        button { padding: 8px 16px; margin: 4px; cursor: pointer; background: #16213e; color: #e0e0e0; border: 1px solid #00d4ff; }
+        button:hover { background: #0f3460; }
+        pre { background: #0d1117; padding: 12px; border: 1px solid #333; overflow-x: auto; max-height: 400px; overflow-y: auto; }
+        #status { color: #00ff88; }
+    </style>
+</head>
+<body>
+    <h1>Lottery Sim — Phase-1 Harness</h1>
+    <p>Minimal WASM loader. No 3D rendering — foundation only.</p>
+    <div>
+        <button id="btn-run">Run Simulation</button>
+        <button id="btn-export" disabled>Export Replay</button>
+    </div>
+    <p id="status">Ready.</p>
+    <pre id="output"></pre>
+
+    <script type="module">
+        import init, { WasmSimulation } from './pkg/lottery_sim_wasm.js';
+
+        const status = document.getElementById('status');
+        const output = document.getElementById('output');
+        const btnRun = document.getElementById('btn-run');
+        const btnExport = document.getElementById('btn-export');
+
+        let sim = null;
+        // Placeholder WASM hash (will be replaced with actual hash in production).
+        const WASM_HASH = '0'.repeat(64);
+
+        function log(msg) {
+            output.textContent += msg + '\n';
+            output.scrollTop = output.scrollHeight;
+        }
+
+        btnRun.addEventListener('click', async () => {
+            try {
+                status.textContent = 'Initializing WASM...';
+                await init();
+
+                status.textContent = 'Creating simulation...';
+                const params = JSON.stringify({
+                    ball_count: 50,
+                    required_exits: 6,
+                    ball_radius: 0.02,
+                    ball_mass: 0.010,
+                    drum_radius: 0.5,
+                    drum_height: 0.4,
+                    gravity: 9.81,
+                    restitution: 0.6,
+                    friction: 0.3,
+                    fixed_dt: 0.008333333,
+                    max_draw_duration_frames: 36000,
+                    chute_exit_normal: [0.0, -1.0, 0.0],
+                    chute_exit_origin: [0.0, -0.5, 0.0],
+                    exit_velocity_threshold: 0.01,
+                    exit_position_threshold: 0.005,
+                    exit_distance_quantum: 0.001,
+                    deadlock: {
+                        drum_stall_mss_threshold: 0.200,
+                        drum_stall_window_frames: 240,
+                        chute_jam_window_frames: 360,
+                        chute_progress_epsilon: 0.01,
+                        nudge_force_magnitude: 5.0,
+                        max_nudges_per_ball: 3,
+                        max_global_nudges: 20,
+                        check_interval_frames: 120,
+                    },
+                    cpsf_checkpoint_interval_frames: 120,
+                });
+
+                const seed = BigInt(42);
+                sim = new WasmSimulation(params, seed, WASM_HASH);
+                log('Simulation initialized. Seed: 42');
+
+                status.textContent = 'Running simulation...';
+                const startTime = performance.now();
+                let stepCount = 0;
+                while (!sim.is_completed() && stepCount < 36000) {
+                    sim.step(120);  // Step 1 second of sim time at a time.
+                    stepCount += 120;
+                    if (stepCount % 1200 === 0) {
+                        log(`  Frame ${sim.frame()}...`);
+                    }
+                }
+                const elapsed = (performance.now() - startTime).toFixed(1);
+                log(`Simulation complete at frame ${sim.frame()} (${elapsed}ms wall)`);
+
+                const outcome = sim.get_outcome();
+                log('Outcome: ' + outcome);
+
+                const cp = sim.get_cpsf_checkpoint();
+                log('Final CPSF: ' + cp);
+
+                btnExport.disabled = false;
+                status.textContent = 'Done. Click "Export Replay" to download.';
+            } catch (e) {
+                status.textContent = 'Error: ' + e;
+                log('ERROR: ' + e);
+            }
+        });
+
+        btnExport.addEventListener('click', () => {
+            if (!sim) return;
+            try {
+                const replayBytes = sim.export_replay();
+                const blob = new Blob([replayBytes], { type: 'application/octet-stream' });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = 'lottery_sim.replay';
+                a.click();
+                URL.revokeObjectURL(url);
+                log('Replay exported.');
+                status.textContent = 'Replay file downloaded.';
+            } catch (e) {
+                log('Export error: ' + e);
+            }
+        });
+    </script>
+</body>
+</html>
